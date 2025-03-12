@@ -1,0 +1,59 @@
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import StandardScaler
+import joblib
+
+# Load dataset
+data = pd.read_excel('soil_dataset.xlsx')
+
+# Features and target variables
+X = data[['pH', 'EC', 'Moisture']].values
+y = data[['Nitrogen', 'Phosphorus', 'Potassium']].values
+
+# Split dataset
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=42)
+
+# Train Random Forest Model
+rf_regressor = RandomForestRegressor(n_estimators=100, random_state=42)
+rf_regressor.fit(X_train, y_train)
+
+# Save the Random Forest model
+joblib.dump(rf_regressor, 'rf_model.pkl')
+
+# Feature scaling for Neural Network
+scaler_X = StandardScaler()
+scaler_y = StandardScaler()
+X_train_scaled = scaler_X.fit_transform(X_train)
+y_train_scaled = scaler_y.fit_transform(y_train)
+
+# Save scalers
+joblib.dump(scaler_X, 'scaler_X.pkl')
+joblib.dump(scaler_y, 'scaler_y.pkl')
+
+# Define TensorFlow model
+input_layer = tf.keras.layers.Input(shape=(3,))
+dense1 = tf.keras.layers.Dense(64, activation="relu")(input_layer)
+dense2 = tf.keras.layers.Dense(64, activation="relu")(dense1)
+output_layer = tf.keras.layers.Dense(3, activation="linear")(dense2)
+
+tf_model = tf.keras.Model(inputs=input_layer, outputs=output_layer)
+tf_model.compile(optimizer="adam", loss="mse")
+
+# Train TensorFlow model
+tf_model.fit(X_train_scaled, y_train_scaled, epochs=100, verbose=1)
+
+# Save TensorFlow model
+tf_model.save("soil_npk_model")
+
+# Convert to TFLite model
+converter = tf.lite.TFLiteConverter.from_saved_model("soil_npk_model")
+tflite_model = converter.convert()
+
+# Save .tflite file
+with open("soil_npk_model.tflite", "wb") as f:
+    f.write(tflite_model)
+
+print("Model converted to TFLite successfully!")

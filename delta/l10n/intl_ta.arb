@@ -1,0 +1,13 @@
+{
+  "appTitle": "டெல்டா",
+  "currentLocation": "தற்போதைய இடம்",
+  "receivedData": "பெறப்பட்ட தரவுகள்",
+  "sensorData": "சென்சார் தரவுகள்",
+  "predictedData": "முன்னறியப்பட்ட தரவுகள்",
+  "suggestedCrops": "பரிந்துரைக்கப்பட்ட பயிர்கள்",
+  "scale": "அளவீடு",
+  "phoneNumber": "தொலைபேசி எண்",
+  "sendWaypoints": "வழிமுறைகளை அனுப்பவும்",
+  "start": "தொடங்கு",
+  "waypointsSent": "வழிமுறைகள் வெற்றிகரமாக அனுப்பப்பட்டன!"
+}

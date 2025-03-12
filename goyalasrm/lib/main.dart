@@ -1,79 +1,23 @@
 import 'package:flutter/material.dart';
-// Import packages for communication (e.g., flutter_blue for Bluetooth)
-// import 'package:flutter_background_messenger/flutter_background_messenger.dart';
-import 'package:flutter_sms/flutter_sms.dart';
-import 'package:flutter/material.dart';
 import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:google_places_flutter/google_places_flutter.dart';
 import 'package:google_places_flutter/model/place_type.dart';
 import 'package:google_places_flutter/model/prediction.dart';
+import 'package:another_telephony/telephony.dart';
+import 'package:tflite_flutter/tflite_flutter.dart';
+
+@pragma('vm:entry-point')
+onBackgroundMessage(SmsMessage message) {
+  debugPrint("onBackgroundMessage called");
+}
 
 void main() => runApp(MyApp());
 
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(home: SmsPage());
-  }
-}
-
-class SmsPage extends StatefulWidget {
-  @override
-  _SmsPageState createState() => _SmsPageState();
-}
-
-class _SmsPageState extends State<SmsPage> {
-  // Initialize communication (e.g., Bluetooth)
-  String receivedMessage = "";
-  //  final messenger = FlutterBackgroundMessenger();
-
-  @override
-  void initState() {
-    super.initState();
-    // Set up communication listener
-    //  sendSMS();
-  }
-  // void _sendSMS(String message, List<String> recipents) async {
-  //  String _result = await sendSMS(message: message, recipients: recipents)
-  //         .catchError((onError) {
-  //       print(onError);
-  //     });
-  // print(_result);
-  // }
-  // Future<void> sendSMS() async {
-  //   try {
-  //     final success = await messenger.sendSMS(
-  //       phoneNumber: '+917825033051',
-  //       message: 'Hello from Flutter Background Messenger!',
-  //     );
-
-  //     if (success) {
-  //       print('SMS sent successfully');
-  //     } else {
-  //       print('Failed to send SMS');
-  //     }
-  //   } catch (e) {
-  //     print('Error sending SMS: $e');
-  //   }
-  // }
-
-  @override
-  Widget build(BuildContext context) {
-    return Scaffold(
-      appBar: AppBar(title: Text('GSM SMS Controller')),
-      body: Column(
-        children: [
-          Text('Received: $receivedMessage'),
-          TextField(
-            onSubmitted: (text) {
-              //sendSMS();
-            },
-            decoration: InputDecoration(labelText: 'Enter message'),
-          ),
-        ],
-      ),
-    );
+    return MaterialApp(home: MapScreen());
   }
 }
 
@@ -85,35 +29,65 @@ class MapScreen extends StatefulWidget {
 }
 
 class _MapScreenState extends State<MapScreen> {
-  final TextEditingController _sourceController = TextEditingController();
-  final TextEditingController _destinationController = TextEditingController();
-  final TextEditingController _rangeController = TextEditingController();
   Set<Marker> _markers = {};
   Set<Polyline> _polylines = {};
+  Set<Polygon> _polygons = {};
   bool _isLoading = false;
+  bool _isSelecting = false;
+  bool _showWaypointScale = false;
 
-  bool _searchByOpeningHours = false;
-  LatLng _currentPosition = const LatLng(
-    13.085758559399656,
-    80.1754404576725,
-  ); // Example start location
-  // 11.387819148378416, 79.73058865396625
+  late LatLng _currentPosition;
+  late GoogleMapController _mapController;
+
+  List<LatLng> _polygonLatLngs = [];
+  List<LatLng> _waypoints = [];
+  int _numWaypoints = 10; // Default number of waypoints
+
+  final Telephony telephony = Telephony.instance;
+  final TextEditingController _phoneNumberController = TextEditingController();
+  Interpreter? _interpreter;
+
   @override
   void initState() {
     super.initState();
     _getCurrentLocation();
+    _loadModel();
+    _listenForSms();
+  }
+
+  Future<void> _loadModel() async {
+    try {
+      _interpreter = await Interpreter.fromAsset(
+        'assets/soil_npk_model.tflite',
+      );
+      print("TFLite model loaded successfully.");
+      _predict([1, 2, 3]);
+    } catch (e) {
+      print("Error loading model: $e");
+    }
+  }
+
+  List<double> _predict(List<double> inputData) {
+    if (_interpreter == null) {
+      throw Exception("Model is not loaded yet.");
+    }
+
+    var input = inputData; // Model expects 2D array
+    var output = List.generate(
+      1,
+      (index) => List.filled(3, 0.0),
+    ); // Output NPK values
+
+    _interpreter!.run(input, output);
+    return output[0]; // Returns [Nitrogen, Phosphorus, Potassium]
   }
 
   Future<Position> determinePosition() async {
     bool serviceEnabled;
     LocationPermission permission;
 
-    // Test if location services are enabled.
     serviceEnabled = await Geolocator.isLocationServiceEnabled();
     if (!serviceEnabled) {
-      // Location services are not enabled don't continue
-      // accessing the position and request users of the
-      // App to enable the location services.
       return Future.error('Location services are disabled.');
     }
 
@@ -121,24 +95,16 @@ class _MapScreenState extends State<MapScreen> {
     if (permission == LocationPermission.denied) {
       permission = await Geolocator.requestPermission();
       if (permission == LocationPermission.denied) {
-        // Permissions are denied, next time you could try
-        // requesting permissions again (this is also where
-        // Android's shouldShowRequestPermissionRationale
-        // returned true. According to Android guidelines
-        // your App should show an explanatory UI now.
         return Future.error('Location permissions are denied');
       }
     }
 
     if (permission == LocationPermission.deniedForever) {
-      // Permissions are denied forever, handle appropriately.
       return Future.error(
         'Location permissions are permanently denied, we cannot request permissions.',
       );
     }
 
-    // When we reach here, permissions are granted and we can
-    // continue accessing the position of the device.
     return await Geolocator.getCurrentPosition();
   }
 
@@ -146,185 +112,339 @@ class _MapScreenState extends State<MapScreen> {
     Position position = await determinePosition();
     setState(() {
       _currentPosition = LatLng(position.latitude, position.longitude);
+      _markers.add(
+        Marker(
+          markerId: MarkerId('currentLocation'),
+          position: _currentPosition,
+          infoWindow: InfoWindow(title: 'Current Location'),
+        ),
+      );
+    });
+    _mapController.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(target: _currentPosition, zoom: 12),
+      ),
+    );
+  }
+
+  void _onMapTapped(LatLng latLng) {
+    if (!_isSelecting) return;
+
+    setState(() {
+      _polygonLatLngs.add(latLng);
+      _markers.add(
+        Marker(
+          markerId: MarkerId(latLng.toString()),
+          position: latLng,
+          draggable: true,
+          onDragEnd: (newPosition) {
+            setState(() {
+              _polygonLatLngs[_polygonLatLngs.indexOf(latLng)] = newPosition;
+              _updatePolygon();
+            });
+          },
+        ),
+      );
+      if (_polygonLatLngs.length == 4) {
+        _updatePolygon();
+        _generateWaypoints();
+      }
     });
   }
 
-  void _showSearchOptionsDialog() {
-    showDialog(
-      context: context,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: const Text('Search Options'),
-          content: const Text('Do you want to search by opening hours?'),
-          actions: <Widget>[
-            TextButton(
-              child: const Text('No'),
-              onPressed: () {
-                setState(() {
-                  _searchByOpeningHours = false;
-                });
-                Navigator.of(context).pop();
-              },
-            ),
-            TextButton(
-              child: const Text('Yes'),
-              onPressed: () {
-                setState(() {
-                  _searchByOpeningHours = true;
-                });
-                Navigator.of(context).pop();
-              },
-            ),
-          ],
-        );
-      },
+  void _updatePolygon() {
+    setState(() {
+      _polygons.clear();
+      _polygons.add(
+        Polygon(
+          polygonId: PolygonId('selectedArea'),
+          points: _polygonLatLngs,
+          strokeColor: Colors.blue,
+          strokeWidth: 2,
+          fillColor: Colors.blue.withOpacity(0.15),
+        ),
+      );
+    });
+  }
+
+  void _generateWaypoints() {
+    if (_polygonLatLngs.length != 4) return;
+
+    _waypoints.clear();
+
+    // Calculate the bounding box
+    double minLat = _polygonLatLngs
+        .map((p) => p.latitude)
+        .reduce((a, b) => a < b ? a : b);
+    double maxLat = _polygonLatLngs
+        .map((p) => p.latitude)
+        .reduce((a, b) => a > b ? a : b);
+    double minLng = _polygonLatLngs
+        .map((p) => p.longitude)
+        .reduce((a, b) => a < b ? a : b);
+    double maxLng = _polygonLatLngs
+        .map((p) => p.longitude)
+        .reduce((a, b) => a > b ? a : b);
+
+    // Generate waypoints evenly distributed within the bounding box
+    double latStep = (maxLat - minLat) / (_numWaypoints / 2);
+    double lngStep = (maxLng - minLng) / (_numWaypoints / 2);
+
+    for (double lat = minLat; lat <= maxLat; lat += latStep) {
+      for (double lng = minLng; lng <= maxLng; lng += lngStep) {
+        LatLng waypoint = LatLng(lat, lng);
+        if (_isPointInPolygon(waypoint, _polygonLatLngs)) {
+          _waypoints.add(waypoint);
+        }
+      }
+    }
+
+    // Add waypoints as markers
+    for (LatLng waypoint in _waypoints) {
+      _markers.add(
+        Marker(
+          markerId: MarkerId(waypoint.toString()),
+          position: waypoint,
+          icon: BitmapDescriptor.defaultMarkerWithHue(
+            BitmapDescriptor.hueGreen,
+          ),
+        ),
+      );
+    }
+  }
+
+  bool _isPointInPolygon(LatLng point, List<LatLng> polygon) {
+    int intersectCount = 0;
+    for (int j = 0; j < polygon.length - 1; j++) {
+      if (_rayCastIntersect(point, polygon[j], polygon[j + 1])) {
+        intersectCount++;
+      }
+    }
+    return (intersectCount % 2) == 1; // odd = inside, even = outside;
+  }
+
+  bool _rayCastIntersect(LatLng point, LatLng vertA, LatLng vertB) {
+    double aY = vertA.latitude;
+    double bY = vertB.latitude;
+    double aX = vertA.longitude;
+    double bX = vertB.longitude;
+    double pY = point.latitude;
+    double pX = point.longitude;
+
+    if ((aY > pY && bY > pY) || (aY < pY && bY < pY) || (aX < pX && bX < pX)) {
+      return false;
+    }
+
+    double m = (aY - bY) / (aX - bX);
+    double bee = (-aX) * m + aY;
+    double x = (pY - bee) / m;
+
+    return x > pX;
+  }
+
+  void _clearSelection() {
+    setState(() {
+      _polygonLatLngs.clear();
+      _markers.clear();
+      _polygons.clear();
+      _waypoints.clear();
+    });
+  }
+
+  void _focusCurrentLocation() {
+    _mapController.animateCamera(
+      CameraUpdate.newCameraPosition(
+        CameraPosition(target: _currentPosition, zoom: 12),
+      ),
     );
+  }
+
+  void _toggleSelectionMode() {
+    setState(() {
+      _isSelecting = !_isSelecting;
+    });
+  }
+
+  void _toggleWaypointScale() {
+    setState(() {
+      _showWaypointScale = !_showWaypointScale;
+    });
+  }
+
+  String _waypointsToString() {
+    return _waypoints.map((wp) => '${wp.latitude},${wp.longitude}').join('; ');
+  }
+
+  void _sendWaypoints() async {
+    print("sending...");
+
+    String message = _waypointsToString();
+    int chunkSize = 160 - 4; // Adjust for "GPS: " prefix
+    List<String> messageChunks = [];
+    List<String> waypoints = message.split('; ');
+
+    StringBuffer currentChunk = StringBuffer();
+
+    for (String waypoint in waypoints) {
+      if (currentChunk.length + waypoint.length + 2 > chunkSize) {
+        messageChunks.add("GPS: " + currentChunk.toString());
+        currentChunk.clear();
+      }
+      if (currentChunk.isNotEmpty) {
+        currentChunk.write('; ');
+      }
+      currentChunk.write(waypoint);
+    }
+
+    if (currentChunk.isNotEmpty) {
+      messageChunks.add("GPS: " + currentChunk.toString());
+    }
+
+    // Send each chunk as a separate SMS
+    for (String chunk in messageChunks) {
+      await telephony.sendSms(
+        to:
+            _phoneNumberController
+                .text, // Use the phone number from the input field
+        message: chunk,
+      );
+    }
+
+    print("Sent");
+    ScaffoldMessenger.of(
+      context,
+    ).showSnackBar(SnackBar(content: Text('Waypoints sent successfully!')));
+  }
+
+  void _listenForSms() {
+    telephony.listenIncomingSms(
+      onNewMessage: (SmsMessage message) {
+        if (message.address == _phoneNumberController.text) {
+          _processReceivedSms(message.body ?? '');
+        }
+      },
+      listenInBackground: false,
+    );
+  }
+
+  void _processReceivedSms(String message) {
+    // Example message format: "Lat:12.3456,Lng:78.9012,Sensor:1.23,4.56,7.89"
+    final parts = message.split(',');
+    if (parts.length >= 5) {
+      final lat = double.tryParse(parts[0].split(':')[1]);
+      final lng = double.tryParse(parts[1].split(':')[1]);
+      final sensorData =
+          parts
+              .sublist(2)
+              .map((e) => double.tryParse(e.split(':')[1]))
+              .toList();
+
+      if (lat != null && lng != null && sensorData.every((e) => e != null)) {
+        final position = LatLng(lat, lng);
+        final sensorInfo = 'Sensor Data: ${sensorData.join(', ')}';
+
+        setState(() {
+          _markers.add(
+            Marker(
+              markerId: MarkerId(position.toString()),
+              position: position,
+              infoWindow: InfoWindow(
+                title: 'Received Data',
+                snippet: sensorInfo,
+              ),
+            ),
+          );
+        });
+
+        ScaffoldMessenger.of(
+          context,
+        ).showSnackBar(SnackBar(content: Text('Received data: $sensorInfo')));
+      }
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Charger'),
+        title: const Text('Delta Farmer'),
         actions: [
+          IconButton(icon: Icon(Icons.delete), onPressed: _clearSelection),
           IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: _showSearchOptionsDialog,
+            icon: Icon(Icons.settings),
+            onPressed: _toggleWaypointScale,
           ),
         ],
       ),
-      body: Stack(
+      body: Column(
         children: [
-          GoogleMap(
-            initialCameraPosition: CameraPosition(
-              target: _currentPosition,
-              zoom: 12,
-            ),
-            markers: _markers,
-            polylines: _polylines,
-            onMapCreated: (GoogleMapController controller) {},
-          ),
-          Positioned(
-            left: 0,
-            right: 0,
-            child: Card(
-              child: Padding(
-                padding: const EdgeInsets.all(10),
-                child: Column(
-                  children: [
-                    GooglePlaceAutoCompleteTextField(
-                      textEditingController: _sourceController,
-                      googleAPIKey: "AIzaSyD-tezFTBpKRVH1icGYGyJUP4SQPyUrPaE",
-                      inputDecoration: const InputDecoration(
-                        label: Text('Enter Source'),
-                      ),
-                      debounceTime: 800, // default 600 ms,
-                      countries: const [
-                        "in",
-                        "fr",
-                      ], // optional by default null is set
-                      isLatLngRequired:
-                          true, // if you required coordinates from place detail
-                      getPlaceDetailWithLatLng: (Prediction prediction) {
-                        // this method will return latlng with place detail
-                        print("placeDetails" + prediction.lng.toString());
-                        _sourceController.text =
-                            '${prediction.lat.toString()},${prediction.lng.toString()}';
-                      }, // this callback is called when isLatLngRequired is true
-                      itemClick: (Prediction prediction) {},
-                      // if we want to make custom list item builder
-                      itemBuilder: (context, index, Prediction prediction) {
-                        return Container(
-                          padding: const EdgeInsets.all(10),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.location_on),
-                              const SizedBox(width: 7),
-                              Expanded(
-                                child: Text("${prediction.description ?? ""}"),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                      // if you want to add seperator between list items
-                      seperatedBuilder: const Divider(),
-                      // want to show close icon
-                      isCrossBtnShown: true,
-                      // optional container padding
-                      containerHorizontalPadding: 10,
-                      // place type
-                      placeType: PlaceType.geocode,
+          if (_showWaypointScale)
+            Padding(
+              padding: const EdgeInsets.all(8.0),
+              child: Column(
+                children: [
+                  TextField(
+                    decoration: InputDecoration(
+                      labelText: 'Number of Waypoints',
+                      border: OutlineInputBorder(),
                     ),
-                    const SizedBox(height: 10),
-                    GooglePlaceAutoCompleteTextField(
-                      textEditingController: _destinationController,
-                      googleAPIKey: "AIzaSyD-tezFTBpKRVH1icGYGyJUP4SQPyUrPaE",
-                      inputDecoration: const InputDecoration(
-                        label: Text('Enter Destination'),
-                      ),
-                      debounceTime: 800, // default 600 ms,
-                      countries: const [
-                        "in",
-                        "fr",
-                      ], // optional by default null is set
-                      isLatLngRequired:
-                          true, // if you required coordinates from place detail
-                      getPlaceDetailWithLatLng: (Prediction prediction) {
-                        // this method will return latlng with place detail
-                        print("placeDetails" + prediction.lng.toString());
-                        _destinationController.text =
-                            '${prediction.lat.toString()},${prediction.lng.toString()}';
-                      }, // this callback is called when isLatLngRequired is true
-                      itemClick: (Prediction prediction) {
-                        // _destinationController.selection =
-                        //     TextSelection.fromPosition(TextPosition(
-                        //         offset:
-                        //             prediction.description?.length ?? 0));
-                      },
-                      // if we want to make custom list item builder
-                      itemBuilder: (context, index, Prediction prediction) {
-                        return Container(
-                          padding: const EdgeInsets.all(10),
-                          child: Row(
-                            children: [
-                              const Icon(Icons.location_on),
-                              const SizedBox(width: 7),
-                              Expanded(
-                                child: Text("${prediction.description ?? ""}"),
-                              ),
-                            ],
-                          ),
-                        );
-                      },
-                      // if you want to add seperator between list items
-                      seperatedBuilder: const Divider(),
-                      // want to show close icon
-                      isCrossBtnShown: true,
-                      // optional container padding
-                      containerHorizontalPadding: 10,
-                      // place type
-                      placeType: PlaceType.geocode,
+                    keyboardType: TextInputType.number,
+                    onChanged: (value) {
+                      setState(() {
+                        _numWaypoints = int.tryParse(value) ?? 10;
+                      });
+                    },
+                  ),
+                  SizedBox(height: 10),
+                  TextField(
+                    controller: _phoneNumberController,
+                    decoration: InputDecoration(
+                      labelText: 'Phone Number',
+                      border: OutlineInputBorder(),
                     ),
-                    const SizedBox(height: 10),
-                    TextField(
-                      controller: _rangeController,
-                      decoration: InputDecoration(
-                        hintText: 'Enter vehicle range',
-                        filled: true,
-                        fillColor: Colors.white,
-                        border: OutlineInputBorder(
-                          borderRadius: BorderRadius.circular(8.0),
-                          borderSide: BorderSide.none,
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
+                    keyboardType: TextInputType.phone,
+                  ),
+                ],
               ),
             ),
+          Expanded(
+            child: GoogleMap(
+              mapType: MapType.satellite, // Set the map type to satellite
+              initialCameraPosition: CameraPosition(
+                target: LatLng(
+                  0,
+                  0,
+                ), // Default position before getting current location
+                zoom: 12,
+              ),
+              markers: _markers,
+              polylines: _polylines,
+              polygons: _polygons,
+              onMapCreated: (GoogleMapController controller) {
+                _mapController = controller;
+              },
+              onTap: _onMapTapped,
+            ),
           ),
-          if (_isLoading) const Center(child: CircularProgressIndicator()),
+        ],
+      ),
+      floatingActionButton: Column(
+        mainAxisAlignment: MainAxisAlignment.end,
+        children: [
+          FloatingActionButton(
+            onPressed: _toggleSelectionMode,
+            child: Icon(_isSelecting ? Icons.check : Icons.edit),
+          ),
+          SizedBox(height: 10),
+          FloatingActionButton(
+            onPressed: _focusCurrentLocation,
+            child: Icon(Icons.my_location),
+          ),
+          SizedBox(height: 10),
+          FloatingActionButton(
+            onPressed: _sendWaypoints,
+            child: Icon(Icons.send),
+          ),
         ],
       ),
     );

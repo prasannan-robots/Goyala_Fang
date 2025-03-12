@@ -1,0 +1,2 @@
+/home/prasannan-robot/Projects/Goyala Fang SRM/goyalasrm/android/app/.cxx/Debug/5n5fn3d5/arm64-v8a/CMakeFiles/edit_cache.dir
+/home/prasannan-robot/Projects/Goyala Fang SRM/goyalasrm/android/app/.cxx/Debug/5n5fn3d5/arm64-v8a/CMakeFiles/rebuild_cache.dir
