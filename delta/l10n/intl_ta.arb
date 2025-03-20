@@ -1,13 +1,19 @@
 {
   "appTitle": "டெல்டா",
-  "currentLocation": "தற்போதைய இடம்",
-  "receivedData": "பெறப்பட்ட தரவுகள்",
-  "sensorData": "சென்சார் தரவுகள்",
-  "predictedData": "முன்னறியப்பட்ட தரவுகள்",
-  "suggestedCrops": "பரிந்துரைக்கப்பட்ட பயிர்கள்",
-  "scale": "அளவீடு",
+  "selectTransmissionMode": "பரிமாற்ற முறையைத் தேர்ந்தெடுக்கவும்",
+  "enterMobileNumber": "மொபைல் எண்ணை உள்ளிடவும்",
+  "selectBluetoothDevice": "ப்ளூடூத் சாதனத்தைத் தேர்ந்தெடுக்கவும்",
   "phoneNumber": "தொலைபேசி எண்",
-  "sendWaypoints": "வழிமுறைகளை அனுப்பவும்",
-  "start": "தொடங்கு",
-  "waypointsSent": "வழிமுறைகள் வெற்றிகரமாக அனுப்பப்பட்டன!"
+  "noBluetoothDevicesFound": "ப்ளூடூத் சாதனங்கள் எதுவும் கிடைக்கவில்லை",
+  "errorLoadingDevices": "சாதனங்களை ஏற்றுவதில் பிழை",
+  "connect": "இணைக்கவும்",
+  "selectAnAreaOnTheMap": "வரைபடத்தில் ஒரு பகுதியைத் தேர்ந்தெடுக்கவும்",
+  "sensorData": "சென்சார் தரவு",
+  "predictedData": "முன்னறியப்பட்ட தரவு",
+  "suggestedCrops": "பரிந்துரைக்கப்பட்ட பயிர்கள்",
+  "suggestedNpkFertilizerAmount": "பரிந்துரைக்கப்பட்ட NPK உர அளவு",
+  "finalReport": "இறுதி அறிக்கை",
+  "averageNpkValues": "சராசரி NPK மதிப்புகள்",
+  "receivedData": "பெறப்பட்ட தரவு: {sensorInfo}",
+  "waypointsSentSuccessfully": "வழிமுறைகள் வெற்றிகரமாக அனுப்பப்பட்டன!"
 }

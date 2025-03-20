@@ -1,0 +1,19 @@
+{
+  "appTitle": "Delta",
+  "selectTransmissionMode": "Select Transmission Mode",
+  "enterMobileNumber": "Enter Mobile Number",
+  "selectBluetoothDevice": "Select Bluetooth Device",
+  "phoneNumber": "Phone Number",
+  "noBluetoothDevicesFound": "No Bluetooth devices found",
+  "errorLoadingDevices": "Error loading devices",
+  "connect": "Connect",
+  "selectAnAreaOnTheMap": "Select an area on the map",
+  "sensorData": "Sensor Data",
+  "predictedData": "Predicted Data",
+  "suggestedCrops": "Suggested Crops",
+  "suggestedNpkFertilizerAmount": "Suggested NPK Fertilizer Amount",
+  "finalReport": "Final Report",
+  "averageNpkValues": "Average NPK Values",
+  "receivedData": "Received data: {sensorInfo}",
+  "waypointsSentSuccessfully": "Waypoints sent successfully!"
+}

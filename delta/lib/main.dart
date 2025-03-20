@@ -10,18 +10,38 @@ import 'package:bluetooth_classic/bluetooth_classic.dart';
 import 'package:bluetooth_classic/models/device.dart';
 import 'package:flutter_localization/flutter_localization.dart';
 import 'package:intl/intl.dart';
+import 'package:easy_localization/easy_localization.dart';
 
 @pragma('vm:entry-point')
 onBackgroundMessage(SmsMessage message) {
   debugPrint("onBackgroundMessage called");
 }
 
-void main() => runApp(MyApp());
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await EasyLocalization.ensureInitialized();
+  runApp(EasyLocalization(
+      supportedLocales: [
+        Locale('en', 'US'),
+        Locale('ta', 'IN'),
+      ],
+      path: 'assets/translations',
+      fallbackLocale: Locale('ta', 'IN'),
+      child: MyApp()));
+}
 
 class MyApp extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(home: MapScreen());
+    return MaterialApp(
+      localizationsDelegates: context.localizationDelegates,
+      supportedLocales: context.supportedLocales,
+      locale: context.locale,
+      theme: ThemeData(
+        primarySwatch: Colors.red,
+      ),
+      home: const MapScreen(),
+    );
   }
 }
 
@@ -41,7 +61,7 @@ class _MapScreenState extends State<MapScreen> {
   bool _isSelecting = false;
   bool _showWaypointScale = false;
 
-  LatLng _currentPosition = LatLng(12.824518906843178, 80.04677754205541);
+  LatLng _currentPosition = const LatLng(12.824518906843178, 80.04677754205541);
   late GoogleMapController _mapController;
 
   List<LatLng> _polygonLatLngs = [];
@@ -70,14 +90,21 @@ class _MapScreenState extends State<MapScreen> {
     _initBluetooth();
   }
 
+  // @override
+  // void didChangeDependencies() {
+  //   super.didChangeDependencies();
+  //   Future.delayed(Duration.zero, () => _showConnectionDialog());
+  // }
+
   bool _isBluetoothInitializing = false;
 
   Future<void> _initBluetooth() async {
     try {
       await _bluetoothClassicPlugin.initPermissions();
-
-      //await _bluetoothClassicPlugin.stopScan();
-      setState(() {});
+      setState(() {
+        _bluetoothDevices = [];
+        _selectedDevice = null;
+      });
     } catch (e) {
       print("Error initializing Bluetooth: $e");
     }
@@ -142,9 +169,9 @@ class _MapScreenState extends State<MapScreen> {
       _currentPosition = LatLng(position.latitude, position.longitude);
       _markers.add(
         Marker(
-          markerId: MarkerId('currentLocation'),
+          markerId: const MarkerId('currentLocation'),
           position: _currentPosition,
-          infoWindow: InfoWindow(title: 'Current Location'),
+          infoWindow: const InfoWindow(title: 'Current Location'),
         ),
       );
     });
@@ -185,7 +212,7 @@ class _MapScreenState extends State<MapScreen> {
       _polygons.clear();
       _polygons.add(
         Polygon(
-          polygonId: PolygonId('selectedArea'),
+          polygonId: const PolygonId('selectedArea'),
           points: _polygonLatLngs,
           strokeColor: Colors.blue,
           strokeWidth: 2,
@@ -350,7 +377,7 @@ class _MapScreenState extends State<MapScreen> {
     print("Sent");
     ScaffoldMessenger.of(
       context,
-    ).showSnackBar(SnackBar(content: Text('Waypoints sent successfully!')));
+    ).showSnackBar(SnackBar(content: Text('waypointsSentSuccessfully'.tr())));
   }
 
   void _listenForSms() {
@@ -380,7 +407,7 @@ class _MapScreenState extends State<MapScreen> {
       final sensorData = parts[2]
           .split(':')[1]
           .split('-')
-          .map((e) => double.tryParse(e))
+          .map((e) => double.tryParse(e) ?? 0.0)
           .toList();
       print(lat);
       print(lng);
@@ -394,7 +421,7 @@ class _MapScreenState extends State<MapScreen> {
         print(sensorData2);
 
         _sensorInfo =
-            '${sensorData[0]!.toStringAsFixed(2)}pH - ${sensorData[1]!.toStringAsFixed(2)} Moisture';
+            '${sensorData[0].toStringAsFixed(2)}pH - ${sensorData[1].toStringAsFixed(2)} Moisture';
         _predictedData =
             '${sensorData2[0].toStringAsFixed(2)}N ${sensorData2[1].toStringAsFixed(2)}P ${sensorData2[2].toStringAsFixed(2)}K';
         final output = _predictedData;
@@ -411,7 +438,7 @@ class _MapScreenState extends State<MapScreen> {
                 BitmapDescriptor.hueGreen,
               ),
               infoWindow: InfoWindow(
-                title: 'Received Data',
+                title: 'receivedData'.tr(),
                 snippet: output,
                 onTap: () => _showBottomSheet(
                     context, _sensorInfo, _predictedData, sensorData2),
@@ -434,7 +461,8 @@ class _MapScreenState extends State<MapScreen> {
 
         ScaffoldMessenger.of(
           context,
-        ).showSnackBar(SnackBar(content: Text('Received data: $_sensorInfo')));
+        ).showSnackBar(
+            SnackBar(content: Text('receivedData'.tr(args: [_sensorInfo]))));
       }
     } else if (message.startsWith('C:')) {
       message = message.replaceFirst('C:', '');
@@ -464,37 +492,121 @@ class _MapScreenState extends State<MapScreen> {
           ));
         });
       }
+    } else if (message.startsWith('D:')) {
+      _showFinalReport();
     }
   }
+
+  void _showFinalReport() {
+    // Calculate average NPK values
+    List<double> averageNpkValues = _calculateAverageNpkValues();
+
+    // Generate suggested crops and fertilizer amount based on average NPK values
+    final suggestedCrops = suggestCrops(
+        averageNpkValues[0], averageNpkValues[1], averageNpkValues[2]);
+    final suggestedFertilizer = suggestFertilizerAmount(averageNpkValues);
+
+    showModalBottomSheet(
+      context: context,
+      builder: (BuildContext context) {
+        return SingleChildScrollView(
+          child: Container(
+            width: double.infinity,
+            padding: const EdgeInsets.all(16.0),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text('finalReport'.tr(),
+                    style:
+                        TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
+                const SizedBox(height: 10),
+                Text('averageNpkValues'.tr(),
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                Text('N: ${averageNpkValues[0].toStringAsFixed(2)} kg/ha, '
+                    'P: ${averageNpkValues[1].toStringAsFixed(2)} kg/ha, '
+                    'K: ${averageNpkValues[2].toStringAsFixed(2)} kg/ha'),
+                const SizedBox(height: 10),
+                Text('suggestedCrops'.tr(),
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                Text(suggestedCrops.join(', ')),
+                const SizedBox(height: 10),
+                Text('suggestedNpkFertilizerAmount'.tr(),
+                    style: TextStyle(fontWeight: FontWeight.bold)),
+                ...suggestedFertilizer.split('\n').map((suggestion) {
+                  return Card(
+                    margin: const EdgeInsets.symmetric(vertical: 5.0),
+                    child: Padding(
+                      padding: const EdgeInsets.all(8.0),
+                      child: Text(suggestion),
+                    ),
+                  );
+                }).toList(),
+              ],
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  List<double> _calculateAverageNpkValues() {
+    // Collect all NPK values from the received data points
+    List<List<double>> npkValuesList = _markers.map((marker) {
+      // Extract NPK values from the marker's info window snippet
+      final snippet = marker.infoWindow.snippet ?? '';
+      final npkValues =
+          snippet.split(' ').map((e) => double.tryParse(e) ?? 0.0).toList();
+      return npkValues;
+    }).toList();
+
+    // Calculate the average NPK values
+    double totalN = 0.0;
+    double totalP = 0.0;
+    double totalK = 0.0;
+    int count = 0;
+
+    for (var npkValues in npkValuesList) {
+      if (npkValues.length == 3) {
+        totalN += npkValues[0];
+        totalP += npkValues[1];
+        totalK += npkValues[2];
+        count++;
+      }
+    }
+
+    return [totalN / count, totalP / count, totalK / count];
+  }
+
+  final npkCrops = {
+    "high_nitrogen": {
+      "ratio": [30.0, 10.0, 10.0], // Example ratio for leafy greens
+      "crops": ["Lettuce", "Spinach", "Kale", "Hybrid Rice"]
+    },
+    "high_phosphorus": {
+      "ratio": [10.0, 30.0, 20.0], // Example ratio for fruits
+      "crops": ["Apples", "Oranges", "Grapes", "Black Gram"]
+    },
+    "balanced": {
+      "ratio": [20.0, 20.0, 20.0], // Balanced ratio for general use
+      "crops": ["Corn", "Wheat", "Soybeans", "Groundnut"]
+    },
+    "high_potassium": {
+      "ratio": [10.0, 10.0, 30.0], // Example ratio for disease resistance
+      "crops": ["Potatoes", "Tomatoes", "Peppers", "Maize"]
+    }
+  };
 
   List<String> suggestCrops(
       double nitrogen, double phosphorus, double potassium) {
     // Define common NPK ratios and their associated crops
-    final npkCrops = {
-      "high_nitrogen": {
-        "ratio": [30.0, 10.0, 10.0], // Example ratio for leafy greens
-        "crops": ["Lettuce", "Spinach", "Kale"]
-      },
-      "high_phosphorus": {
-        "ratio": [10.0, 30.0, 20.0], // Example ratio for fruits
-        "crops": ["Apples", "Oranges", "Grapes"]
-      },
-      "balanced": {
-        "ratio": [20.0, 20.0, 20.0], // Balanced ratio for general use
-        "crops": ["Corn", "Wheat", "Soybeans"]
-      },
-      "high_potassium": {
-        "ratio": [10.0, 10.0, 30.0], // Example ratio for disease resistance
-        "crops": ["Potatoes", "Tomatoes", "Peppers"]
-      }
-    };
 
     // Calculate the closest match
     String? closestMatch;
     double minDiff = double.infinity;
 
     npkCrops.forEach((npkType, details) {
-      final ratio = details["ratio"] as List<double>;
+      final ratio = (details["ratio"] as List).map((e) => e as double).toList();
       final ratioDiff = (nitrogen - ratio[0]).abs() +
           (phosphorus - ratio[1]).abs() +
           (potassium - ratio[2]).abs();
@@ -506,7 +618,9 @@ class _MapScreenState extends State<MapScreen> {
 
     // Return suggested crops based on the closest match
     if (closestMatch != null) {
-      return npkCrops[closestMatch]!["crops"] as List<String>;
+      return (npkCrops[closestMatch]!["crops"] as List)
+          .map((e) => e as String)
+          .toList();
     } else {
       return [
         "No specific match found. Consider a balanced NPK ratio like 20-20-20."
@@ -514,36 +628,74 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  String suggestFertilizerAmount(List<double> npkValues) {
+    StringBuffer fertilizerSuggestions = StringBuffer();
+
+    npkCrops.forEach((npkType, details) {
+      final ratio = (details["ratio"] as List).map((e) => e as double).toList();
+      final crops = (details["crops"] as List).map((e) => e as String).toList();
+
+      double nitrogenNeeded = ratio[0] - npkValues[0];
+      double phosphorusNeeded = ratio[1] - npkValues[1];
+      double potassiumNeeded = ratio[2] - npkValues[2];
+      double costPerKg = 50; // Example cost per kg of fertilizer
+      double totalCost =
+          (nitrogenNeeded + phosphorusNeeded + potassiumNeeded) * costPerKg;
+
+      fertilizerSuggestions.writeln(
+          '${crops.join(', ')}: N: ${nitrogenNeeded.toStringAsFixed(2)} kg/ha, '
+          'P: ${phosphorusNeeded.toStringAsFixed(2)} kg/ha, '
+          'K: ${potassiumNeeded.toStringAsFixed(2)} kg/ha, '
+          'Cost: \₹${totalCost.toStringAsFixed(2)}');
+    });
+
+    return fertilizerSuggestions.toString();
+  }
+
   void _showBottomSheet(BuildContext context, String sensorInfo,
       String predictedData, List<double> npkValues) {
     print("hlo");
     final suggestedCrops =
         suggestCrops(npkValues[0], npkValues[1], npkValues[2]);
+    final suggestedFertilizer = suggestFertilizerAmount(npkValues);
 
     showModalBottomSheet(
       context: context,
       builder: (BuildContext context) {
-        return Container(
+        return SingleChildScrollView(
+            child: Container(
           width: double.infinity,
-          padding: EdgeInsets.all(16.0),
+          padding: const EdgeInsets.all(16.0),
           child: Column(
             mainAxisSize: MainAxisSize.min,
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text('Sensor Data',
+              Text('sensorData'.tr(),
                   style: TextStyle(fontWeight: FontWeight.bold)),
               Text(sensorInfo),
-              SizedBox(height: 10),
-              Text('Predicted Data',
+              const SizedBox(height: 10),
+              Text('predictedData'.tr(),
                   style: TextStyle(fontWeight: FontWeight.bold)),
               Text(predictedData),
-              SizedBox(height: 10),
-              Text('Suggested Crops',
+              const SizedBox(height: 10),
+              Text('suggestedCrops'.tr(),
                   style: TextStyle(fontWeight: FontWeight.bold)),
               Text(suggestedCrops.join(', ')),
+              const SizedBox(height: 10),
+              Text('suggestedNpkFertilizerAmount'.tr(),
+                  style: TextStyle(fontWeight: FontWeight.bold)),
+              ...suggestedFertilizer.split('\n').map((suggestion) {
+                return Card(
+                  margin: const EdgeInsets.symmetric(vertical: 5.0),
+                  child: Padding(
+                    padding: const EdgeInsets.all(8.0),
+                    child: Text(suggestion),
+                  ),
+                );
+              }).toList(),
             ],
           ),
-        );
+        ));
       },
     );
   }
@@ -571,16 +723,179 @@ class _MapScreenState extends State<MapScreen> {
     }
   }
 
+  void _showConnectionDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text('selectTransmissionMode'.tr()),
+          content: SingleChildScrollView(
+            child: Container(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  SizedBox(
+                    width: 300, // Limit the width of the dropdown
+                    child: DropdownButton<String>(
+                      value: _transmissionMode,
+                      items: <String>['SMS', 'Bluetooth']
+                          .map<DropdownMenuItem<String>>((String value) {
+                        return DropdownMenuItem<String>(
+                          value: value,
+                          child: Text(value),
+                        );
+                      }).toList(),
+                      onChanged: (String? newValue) async {
+                        setState(() {
+                          _transmissionMode = newValue!;
+                          if (_transmissionMode == 'Bluetooth') {
+                            _initBluetooth();
+                          }
+                        });
+                        Navigator.of(context).pop();
+                        _showDetailsDialog();
+                      },
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  void _showDetailsDialog() {
+    showDialog(
+      context: context,
+      barrierDismissible: false,
+      builder: (BuildContext context) {
+        return AlertDialog(
+          title: Text(_transmissionMode == 'SMS'
+              ? 'enterMobileNumber'.tr()
+              : 'selectBluetoothDevice'.tr()),
+          content: SingleChildScrollView(
+            child: Container(
+              width: double.maxFinite,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  if (_transmissionMode == 'SMS')
+                    TextField(
+                      controller: _phoneNumberController,
+                      decoration: InputDecoration(
+                        labelText: 'phoneNumber'.tr(),
+                        border: OutlineInputBorder(),
+                      ),
+                      keyboardType: TextInputType.phone,
+                    ),
+                  if (_transmissionMode == 'Bluetooth')
+                    FutureBuilder<List<Device>>(
+                      future: _bluetoothClassicPlugin.getPairedDevices(),
+                      builder: (context, snapshot) {
+                        if (snapshot.connectionState ==
+                            ConnectionState.waiting) {
+                          return const CircularProgressIndicator();
+                        } else if (snapshot.hasError) {
+                          return Text('errorLoadingDevices'.tr());
+                        } else if (!snapshot.hasData ||
+                            snapshot.data!.isEmpty) {
+                          return Text('noBluetoothDevicesFound'.tr());
+                        } else {
+                          return Container(
+                            width: 350, // Increase the width of the dropdown
+                            child: DropdownButton<Device>(
+                              value: _selectedDevice,
+                              items: snapshot.data!
+                                  .map<DropdownMenuItem<Device>>(
+                                      (Device device) {
+                                return DropdownMenuItem<Device>(
+                                  value: device,
+                                  child: Text(device.name ?? 'Unknown Device'),
+                                );
+                              }).toList(),
+                              onChanged: (Device? newValue) async {
+                                try {
+                                  await _bluetoothClassicPlugin.stopScan();
+                                  await _bluetoothClassicPlugin.connect(
+                                    newValue!.address,
+                                    "00001101-0000-1000-8000-00805f9b34fb",
+                                  );
+                                  setState(() {
+                                    _selectedDevice = newValue;
+                                  });
+                                } catch (e) {
+                                  print("Error connecting to device: $e");
+                                  ScaffoldMessenger.of(context).showSnackBar(
+                                    SnackBar(
+                                        content: Text(
+                                            'Failed to connect to device: ${newValue?.name ?? 'Unknown Device'}')),
+                                  );
+                                }
+                              },
+                            ),
+                          );
+                        }
+                      },
+                    ),
+                ],
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () {
+                Navigator.of(context).pop();
+                _showAreaSelectionGuide();
+              },
+              child: Text('connect'.tr()),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
+  void _showAreaSelectionGuide() {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(content: Text('selectAnAreaOnTheMap'.tr())),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: const Text('Delta'),
+        title: Text('appTitle'.tr().toString()),
         actions: [
-          IconButton(icon: Icon(Icons.delete), onPressed: _clearSelection),
           IconButton(
-            icon: Icon(Icons.settings),
+            icon: const Icon(Icons.delete),
+            onPressed: _clearSelection,
+          ),
+          IconButton(
+            icon: const Icon(Icons.settings),
             onPressed: _toggleWaypointScale,
+          ),
+          PopupMenuButton<Locale>(
+            icon: const Icon(Icons.language),
+            onSelected: (Locale locale) {
+              context.setLocale(locale);
+            },
+            itemBuilder: (BuildContext context) {
+              return [
+                PopupMenuItem(
+                  value: const Locale('en', 'US'),
+                  child: const Text('English'),
+                ),
+                PopupMenuItem(
+                  value: const Locale('ta', 'IN'),
+                  child: const Text('Tamil'),
+                ),
+              ];
+            },
           ),
         ],
       ),
@@ -593,7 +908,7 @@ class _MapScreenState extends State<MapScreen> {
                 children: [
                   TextField(
                     decoration: InputDecoration(
-                      labelText: 'Scale',
+                      labelText: 'scale'.tr(),
                       border: OutlineInputBorder(),
                     ),
                     keyboardType: TextInputType.number,
@@ -603,7 +918,7 @@ class _MapScreenState extends State<MapScreen> {
                       });
                     },
                   ),
-                  SizedBox(height: 10),
+                  const SizedBox(height: 10),
                   DropdownButton<String>(
                     value: _transmissionMode,
                     items: <String>['SMS', 'Bluetooth']
@@ -665,7 +980,7 @@ class _MapScreenState extends State<MapScreen> {
                   if (_transmissionMode == 'SMS')
                     TextField(
                       controller: _phoneNumberController,
-                      decoration: InputDecoration(
+                      decoration: const InputDecoration(
                         labelText: 'Phone Number',
                         border: OutlineInputBorder(),
                       ),
@@ -707,7 +1022,7 @@ class _MapScreenState extends State<MapScreen> {
           Expanded(
             child: GoogleMap(
               mapType: MapType.satellite, // Set the map type to satellite
-              initialCameraPosition: CameraPosition(
+              initialCameraPosition: const CameraPosition(
                 target: LatLng(
                   0,
                   0,
@@ -729,19 +1044,19 @@ class _MapScreenState extends State<MapScreen> {
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
-          FloatingActionButton(
-            onPressed: _toggleSelectionMode,
-            child: Icon(_isSelecting ? Icons.check : Icons.edit),
-          ),
-          SizedBox(height: 10),
+          // FloatingActionButton(
+          //   onPressed: _toggleSelectionMode,
+          //   child: Icon(_isSelecting ? Icons.check : Icons.edit),
+          // ),
+          const SizedBox(height: 10),
           FloatingActionButton(
             onPressed: _focusCurrentLocation,
-            child: Icon(Icons.my_location),
+            child: const Icon(Icons.my_location),
           ),
-          SizedBox(height: 10),
+          const SizedBox(height: 10),
           FloatingActionButton(
             onPressed: _sendWaypoints,
-            child: Icon(Icons.send),
+            child: const Icon(Icons.send),
           ),
         ],
       ),
