@@ -6,7 +6,7 @@ import 'package:google_maps_flutter/google_maps_flutter.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:another_telephony/telephony.dart';
 import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:bluetooth_classic/bluetooth_classic.dart';
+import 'package:flutter_blue_plus/flutter_blue_plus.dart';
 import 'package:bluetooth_classic/models/device.dart';
 import 'package:flutter_localization/flutter_localization.dart';
 import 'package:intl/intl.dart';
@@ -75,11 +75,15 @@ class _MapScreenState extends State<MapScreen> {
   String _sensorInfo = '';
   String _predictedData = '';
 
-  final _bluetoothClassicPlugin = BluetoothClassic();
-  List<Device> _bluetoothDevices = [];
-  Device? _selectedDevice;
-  Uint8List _data = Uint8List(0);
-  String _transmissionMode = 'SMS'; // Default transmission mode
+  final FlutterBluePlus _flutterBlue = FlutterBluePlus();
+  BluetoothDevice? _selectedBleDevice;
+  List<BluetoothDevice> _bleDevices = [];
+  BluetoothCharacteristic? _writeCharacteristic;
+  BluetoothCharacteristic? _notifyCharacteristic;
+  String _transmissionMode = 'Bluetooth'; // Default transmission mode
+  final TextEditingController _lengthController = TextEditingController();
+  final TextEditingController _widthController = TextEditingController();
+  final TextEditingController _seedCountController = TextEditingController();
 
   @override
   void initState() {
@@ -100,13 +104,14 @@ class _MapScreenState extends State<MapScreen> {
 
   Future<void> _initBluetooth() async {
     try {
-      await _bluetoothClassicPlugin.initPermissions();
-      setState(() {
-        _bluetoothDevices = [];
-        _selectedDevice = null;
+      FlutterBluePlus.startScan(timeout: const Duration(seconds: 5));
+      FlutterBluePlus.scanResults.listen((results) {
+        setState(() {
+          _bleDevices = results.map((r) => r.device).toList();
+        });
       });
     } catch (e) {
-      print("Error initializing Bluetooth: $e");
+      print("Error initializing BLE: $e");
     }
   }
 
@@ -327,6 +332,43 @@ class _MapScreenState extends State<MapScreen> {
     return _waypoints.map((wp) => '${wp.latitude},${wp.longitude}').join('; ');
   }
 
+  Future<void> _connectToDevice(BluetoothDevice device) async {
+    try {
+      await device.connect();
+      List<BluetoothService> services = await device.discoverServices();
+      for (var service in services) {
+        for (var characteristic in service.characteristics) {
+          if (characteristic.properties.write) {
+            _writeCharacteristic = characteristic;
+          }
+          if (characteristic.properties.notify) {
+            _notifyCharacteristic = characteristic;
+            await _notifyCharacteristic!.setNotifyValue(true);
+            _notifyCharacteristic!.value.listen((value) {
+              String receivedString = utf8.decode(value);
+              receivedDataBuffer += receivedString;
+              if (receivedString.contains(';')) {
+                _processReceivedSms(receivedDataBuffer);
+                receivedDataBuffer = '';
+              }
+            });
+          }
+        }
+      }
+      setState(() {
+        _selectedBleDevice = device;
+      });
+    } catch (e) {
+      print("Error connecting to BLE device: $e");
+    }
+  }
+
+  Future<void> _sendDataOverBle(String data) async {
+    if (_writeCharacteristic != null) {
+      await _writeCharacteristic!.write(utf8.encode(data));
+    }
+  }
+
   void _sendWaypoints() async {
     print("sending...");
 
@@ -366,12 +408,12 @@ class _MapScreenState extends State<MapScreen> {
             .text, // Use the phone number from the input field
         message: "Start",
       );
-    } else if (_transmissionMode == 'Bluetooth' && _selectedDevice != null) {
+    } else if (_transmissionMode == 'Bluetooth' && _selectedBleDevice != null) {
       // Send data via Bluetooth
       for (String chunk in messageChunks) {
-        await _bluetoothClassicPlugin.write(chunk);
+        await _sendDataOverBle(chunk);
       }
-      await _bluetoothClassicPlugin.write("Start");
+      await _sendDataOverBle("Start");
     }
 
     print("Sent");
@@ -792,53 +834,18 @@ class _MapScreenState extends State<MapScreen> {
                       ),
                       keyboardType: TextInputType.phone,
                     ),
-                  if (_transmissionMode == 'Bluetooth')
-                    FutureBuilder<List<Device>>(
-                      future: _bluetoothClassicPlugin.getPairedDevices(),
-                      builder: (context, snapshot) {
-                        if (snapshot.connectionState ==
-                            ConnectionState.waiting) {
-                          return const CircularProgressIndicator();
-                        } else if (snapshot.hasError) {
-                          return Text('errorLoadingDevices'.tr());
-                        } else if (!snapshot.hasData ||
-                            snapshot.data!.isEmpty) {
-                          return Text('noBluetoothDevicesFound'.tr());
-                        } else {
-                          return Container(
-                            width: 350, // Increase the width of the dropdown
-                            child: DropdownButton<Device>(
-                              value: _selectedDevice,
-                              items: snapshot.data!
-                                  .map<DropdownMenuItem<Device>>(
-                                      (Device device) {
-                                return DropdownMenuItem<Device>(
-                                  value: device,
-                                  child: Text(device.name ?? 'Unknown Device'),
-                                );
-                              }).toList(),
-                              onChanged: (Device? newValue) async {
-                                try {
-                                  await _bluetoothClassicPlugin.stopScan();
-                                  await _bluetoothClassicPlugin.connect(
-                                    newValue!.address,
-                                    "00001101-0000-1000-8000-00805f9b34fb",
-                                  );
-                                  setState(() {
-                                    _selectedDevice = newValue;
-                                  });
-                                } catch (e) {
-                                  print("Error connecting to device: $e");
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    SnackBar(
-                                        content: Text(
-                                            'Failed to connect to device: ${newValue?.name ?? 'Unknown Device'}')),
-                                  );
-                                }
-                              },
-                            ),
-                          );
-                        }
+                  if (_transmissionMode == 'BLE')
+                    DropdownButton<BluetoothDevice>(
+                      value: _selectedBleDevice,
+                      items: _bleDevices.map<DropdownMenuItem<BluetoothDevice>>(
+                          (BluetoothDevice device) {
+                        return DropdownMenuItem<BluetoothDevice>(
+                          value: device,
+                          child: Text(device.name),
+                        );
+                      }).toList(),
+                      onChanged: (BluetoothDevice? newValue) async {
+                        await _connectToDevice(newValue!);
                       },
                     ),
                 ],
@@ -871,14 +878,6 @@ class _MapScreenState extends State<MapScreen> {
       appBar: AppBar(
         title: Text('appTitle'.tr().toString()),
         actions: [
-          IconButton(
-            icon: const Icon(Icons.delete),
-            onPressed: _clearSelection,
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: _toggleWaypointScale,
-          ),
           PopupMenuButton<Locale>(
             icon: const Icon(Icons.language),
             onSelected: (Locale locale) {
@@ -901,124 +900,104 @@ class _MapScreenState extends State<MapScreen> {
       ),
       body: Column(
         children: [
-          if (_showWaypointScale)
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Column(
-                children: [
-                  TextField(
-                    decoration: InputDecoration(
-                      labelText: 'scale'.tr(),
-                      border: OutlineInputBorder(),
-                    ),
-                    keyboardType: TextInputType.number,
-                    onChanged: (value) {
-                      setState(() {
-                        _numWaypoints = int.tryParse(value) ?? 10;
-                      });
-                    },
+          Padding(
+            padding: const EdgeInsets.all(8.0),
+            child: Column(
+              children: [
+                TextField(
+                  controller: _lengthController,
+                  decoration: InputDecoration(
+                    labelText: 'Length (m)'.tr(),
+                    border: OutlineInputBorder(),
                   ),
-                  const SizedBox(height: 10),
-                  DropdownButton<String>(
-                    value: _transmissionMode,
-                    items: <String>['SMS', 'Bluetooth']
-                        .map<DropdownMenuItem<String>>((String value) {
-                      return DropdownMenuItem<String>(
-                        value: value,
-                        child: Text(value),
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _widthController,
+                  decoration: InputDecoration(
+                    labelText: 'Width (m)'.tr(),
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 10),
+                TextField(
+                  controller: _seedCountController,
+                  decoration: InputDecoration(
+                    labelText: 'Seed Count'.tr(),
+                    border: OutlineInputBorder(),
+                  ),
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 10),
+                DropdownButton<String>(
+                  value: _transmissionMode,
+                  items: <String>['SMS', 'Bluetooth']
+                      .map<DropdownMenuItem<String>>((String value) {
+                    return DropdownMenuItem<String>(
+                      value: value,
+                      child: Text(value),
+                    );
+                  }).toList(),
+                  onChanged: (String? newValue) async {
+                    if (newValue == 'Bluetooth') {
+                      await _initBluetooth();
+
+                      try {
+                        _bleDevices = await FlutterBluePlus.connectedDevices;
+                      } catch (e) {
+                        print(e);
+                      }
+
+                      try {
+                        FlutterBluePlus.scanResults.listen(
+                          (results) {
+                            setState(() {
+                              _bleDevices =
+                                  results.map((r) => r.device).toList();
+                            });
+                          },
+                        );
+                        await FlutterBluePlus.startScan();
+                      } catch (e) {
+                        print(e);
+                      }
+                      print(_bleDevices);
+                      try {
+                        FlutterBluePlus.scanResults.listen((results) {
+                          for (ScanResult r in results) {
+                            if (r.device.name == _selectedBleDevice?.name) {
+                              _connectToDevice(r.device);
+                            }
+                          }
+                        });
+                      } catch (e) {
+                        print(e);
+                      }
+                    }
+                    setState(() {
+                      _transmissionMode = newValue!;
+                    });
+                  },
+                ),
+                if (_transmissionMode == 'Bluetooth')
+                  DropdownButton<BluetoothDevice>(
+                    value: _selectedBleDevice,
+                    items: _bleDevices.map<DropdownMenuItem<BluetoothDevice>>(
+                        (BluetoothDevice device) {
+                      return DropdownMenuItem<BluetoothDevice>(
+                        value: device,
+                        child: Text(device.name),
                       );
                     }).toList(),
-                    onChanged: (String? newValue) async {
-                      if (newValue == 'Bluetooth') {
-                        await _initBluetooth();
-
-                        try {
-                          _bluetoothDevices =
-                              await _bluetoothClassicPlugin.getPairedDevices();
-                        } catch (e) {
-                          print(e);
-                        }
-
-                        try {
-                          _bluetoothClassicPlugin.onDeviceDiscovered().listen(
-                            (event) {
-                              _bluetoothDevices = [..._bluetoothDevices, event];
-                            },
-                          );
-                          await _bluetoothClassicPlugin.startScan();
-                        } catch (e) {
-                          print(e);
-                        }
-                        print(_bluetoothDevices);
-                        try {
-                          _bluetoothClassicPlugin
-                              .onDeviceDataReceived()
-                              .listen((event) {
-                            setState(() {
-                              _data = Uint8List.fromList([..._data, ...event]);
-                              String receivedString = utf8.decode(event);
-
-                              receivedDataBuffer += receivedString;
-                              print(receivedString);
-                              if (receivedString.contains(';')) {
-                                print("Buffer");
-                                print(receivedDataBuffer);
-                                _processReceivedSms(receivedDataBuffer);
-                                receivedDataBuffer = '';
-                              }
-                            });
-                          });
-                        } catch (e) {
-                          print(e);
-                        }
-                      }
-                      setState(() {
-                        _transmissionMode = newValue!;
-                      });
+                    onChanged: (BluetoothDevice? newValue) async {
+                      await _connectToDevice(newValue!);
                     },
                   ),
-                  if (_transmissionMode == 'SMS')
-                    TextField(
-                      controller: _phoneNumberController,
-                      decoration: const InputDecoration(
-                        labelText: 'Phone Number',
-                        border: OutlineInputBorder(),
-                      ),
-                      keyboardType: TextInputType.phone,
-                    ),
-                  if (_transmissionMode == 'Bluetooth')
-                    DropdownButton<Device>(
-                      value: _selectedDevice,
-                      items: _bluetoothDevices
-                          .map<DropdownMenuItem<Device>>((Device device) {
-                        return DropdownMenuItem<Device>(
-                          value: device,
-                          child: Text(device.name ?? 'Unknown Device'),
-                        );
-                      }).toList(),
-                      onChanged: (Device? newValue) async {
-                        try {
-                          await _bluetoothClassicPlugin.stopScan();
-                          await _bluetoothClassicPlugin.connect(
-                            newValue!.address,
-                            "00001101-0000-1000-8000-00805f9b34fb",
-                          );
-                          setState(() {
-                            _selectedDevice = newValue;
-                          });
-                        } catch (e) {
-                          print("Error connecting to device: $e");
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                                content: Text(
-                                    'Failed to connect to device: ${newValue?.name ?? 'Unknown Device'}')),
-                          );
-                        }
-                      },
-                    ),
-                ],
-              ),
+              ],
             ),
+          ),
           Expanded(
             child: GoogleMap(
               mapType: MapType.satellite, // Set the map type to satellite
@@ -1044,11 +1023,6 @@ class _MapScreenState extends State<MapScreen> {
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
         children: [
-          // FloatingActionButton(
-          //   onPressed: _toggleSelectionMode,
-          //   child: Icon(_isSelecting ? Icons.check : Icons.edit),
-          // ),
-          const SizedBox(height: 10),
           FloatingActionButton(
             onPressed: _focusCurrentLocation,
             child: const Icon(Icons.my_location),

@@ -47,6 +47,7 @@ dependencies:
   flutter_gen: ^5.9.0
   intl_utils: ^2.8.8
   easy_localization: ^3.0.7+1
+  flutter_blue_plus: ^1.35.3
 
 dev_dependencies:
   flutter_test:
