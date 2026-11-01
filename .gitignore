@@ -1,0 +1,6 @@
+# KiCad auto-backups and lock files
+*-backups/
+*.lck
+fp-info-cache
+# OS / editor
+.DS_Store

@@ -12,6 +12,9 @@ Servo leverServo;
 #define SENSOR1 A2   // First Sensor Pin (pH Sensor)
 #define SENSOR2 A3   // Second Sensor Pin (Moisture Sensor)
 
+// Phone running the Saga app. Readings are sent here by SMS.
+#define CONTROLLER_PHONE "+919840215374"
+
 void setup() {
     Serial.begin(9600);
     sim800.begin(9600); // Initialize GSM Module Communication
@@ -61,14 +64,20 @@ void checkSensors() {
 
     leverServo.write(0); // Move servo back to original position
 
-    String result = "S:Lat:12.820030,Lng:80.039433,Sensor: " + String(phValue) + ", " + String(moistureValue);
+    // Format parsed by the app (delta/lib/logic/robot_protocol.dart):
+    //   S:Lat:<lat>,Lng:<lng>,Sensor:<pH>-<EC>-<moisture>
+    // The NPK model needs pH, EC and moisture; this board has no EC sensor
+    // yet, so the app shows the readings but cannot predict NPK from them.
+    // TODO: replace the fixed coordinates with a GPS fix and calibrate the
+    // raw analogRead() values into pH / moisture units.
+    String result = "S:Lat:12.820030,Lng:80.039433,Sensor:" + String(phValue) + "-" + String(moistureValue);
     sendSMS(result);
 }
 
 void sendSMS(String message) {
     sim800.println("AT+CMGF=1"); // Set SMS mode
     delay(1000);
-    sim800.println("AT+CMGS=\"+919840215374\""); // Set recipient number
+    sim800.println("AT+CMGS=\"" CONTROLLER_PHONE "\""); // Set recipient number
     delay(1000);
     sim800.println(message);
     delay(1000);
