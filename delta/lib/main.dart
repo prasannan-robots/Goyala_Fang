@@ -1,1077 +1,855 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:flutter/material.dart';
-import 'package:google_maps_flutter/google_maps_flutter.dart';
-import 'package:geolocator/geolocator.dart';
 import 'package:another_telephony/telephony.dart';
-import 'package:tflite_flutter/tflite_flutter.dart';
 import 'package:bluetooth_classic/bluetooth_classic.dart';
 import 'package:bluetooth_classic/models/device.dart';
-import 'package:flutter_localization/flutter_localization.dart';
-import 'package:intl/intl.dart';
 import 'package:easy_localization/easy_localization.dart';
+import 'package:flutter/material.dart';
+import 'package:geolocator/geolocator.dart';
+import 'package:google_maps_flutter/google_maps_flutter.dart';
 
-@pragma('vm:entry-point')
-onBackgroundMessage(SmsMessage message) {
-  debugPrint("onBackgroundMessage called");
-}
+import 'logic/field_geometry.dart';
+import 'logic/robot_protocol.dart';
+import 'logic/soil_advisor.dart';
+import 'services/npk_model.dart';
 
-void main() async {
+/// Standard Bluetooth Serial Port Profile UUID (HC-05/HC-06 style modules).
+const _sppUuid = '00001101-0000-1000-8000-00805f9b34fb';
+
+Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await EasyLocalization.ensureInitialized();
-  runApp(EasyLocalization(
-      supportedLocales: [
-        Locale('en', 'US'),
-        Locale('ta', 'IN'),
-      ],
+  runApp(
+    EasyLocalization(
+      supportedLocales: const [Locale('en', 'US'), Locale('ta', 'IN')],
       path: 'assets/translations',
-      fallbackLocale: Locale('ta', 'IN'),
-      child: MyApp()));
+      fallbackLocale: const Locale('ta', 'IN'),
+      child: const SagaApp(),
+    ),
+  );
 }
 
-class MyApp extends StatelessWidget {
+class SagaApp extends StatelessWidget {
+  const SagaApp({super.key});
+
   @override
   Widget build(BuildContext context) {
+    const seed = Color(0xFF2E7D32); // field green
     return MaterialApp(
+      debugShowCheckedModeBanner: false,
+      onGenerateTitle: (_) => 'appTitle'.tr(),
       localizationsDelegates: context.localizationDelegates,
       supportedLocales: context.supportedLocales,
       locale: context.locale,
-      theme: ThemeData(
-        primarySwatch: Colors.red,
-      ),
-      home: const MapScreen(),
+      theme: ThemeData(colorSchemeSeed: seed),
+      darkTheme: ThemeData(colorSchemeSeed: seed, brightness: Brightness.dark),
+      home: const FieldMapScreen(),
     );
   }
 }
 
-class MapScreen extends StatefulWidget {
-  const MapScreen({super.key});
+enum LinkMode { sms, bluetooth }
+
+class FieldMapScreen extends StatefulWidget {
+  const FieldMapScreen({super.key});
 
   @override
-  _MapScreenState createState() => _MapScreenState();
+  State<FieldMapScreen> createState() => _FieldMapScreenState();
 }
 
-class _MapScreenState extends State<MapScreen> {
-  Set<Marker> _markers = {};
-  Set<Polyline> _polylines = {};
-  Set<Polygon> _polygons = {};
-  Set<Circle> _circles = {};
-  bool _isLoading = false;
-  bool _isSelecting = false;
-  bool _showWaypointScale = false;
+class _FieldMapScreenState extends State<FieldMapScreen> {
+  static const _fallbackCenter = LatLng(12.8245, 80.0468);
 
-  LatLng _currentPosition = const LatLng(12.824518906843178, 80.04677754205541);
-  late GoogleMapController _mapController;
+  final _telephony = Telephony.instance;
+  final _bluetooth = BluetoothClassic();
+  final _phoneController = TextEditingController();
+  StreamSubscription<Uint8List>? _bluetoothData;
+  String _bluetoothBuffer = '';
 
-  List<LatLng> _polygonLatLngs = [];
-  List<LatLng> _waypoints = [];
-  int _numWaypoints = 10; // Default number of waypoints
-  String receivedDataBuffer = "";
-  final Telephony telephony = Telephony.instance;
-  final TextEditingController _phoneNumberController = TextEditingController();
-  Interpreter? _interpreter;
+  GoogleMapController? _map;
+  LatLng? _here;
+  NpkModel? _model;
 
-  String _sensorInfo = '';
-  String _predictedData = '';
+  LinkMode _mode = LinkMode.sms;
+  List<Device> _devices = const [];
+  Device? _device;
+  bool _connecting = false;
 
-  final _bluetoothClassicPlugin = BluetoothClassic();
-  List<Device> _bluetoothDevices = [];
-  Device? _selectedDevice;
-  Uint8List _data = Uint8List(0);
-  String _transmissionMode = 'SMS'; // Default transmission mode
+  bool _marking = false;
+  List<LatLng> _corners = [];
+  List<LatLng> _waypoints = const [];
+  int _gridSize = 5;
+  bool _sending = false;
+
+  final List<SoilReading> _readings = [];
+  LatLng? _robot;
+
+  bool get _linkReady => _mode == LinkMode.sms
+      ? _phoneController.text.trim().isNotEmpty
+      : _device != null;
 
   @override
   void initState() {
     super.initState();
-    _getCurrentLocation();
+    _locate();
     _loadModel();
     _listenForSms();
-    _initBluetooth();
   }
 
-  // @override
-  // void didChangeDependencies() {
-  //   super.didChangeDependencies();
-  //   Future.delayed(Duration.zero, () => _showConnectionDialog());
-  // }
-
-  bool _isBluetoothInitializing = false;
-
-  Future<void> _initBluetooth() async {
-    try {
-      await _bluetoothClassicPlugin.initPermissions();
-      setState(() {
-        _bluetoothDevices = [];
-        _selectedDevice = null;
-      });
-    } catch (e) {
-      print("Error initializing Bluetooth: $e");
-    }
+  @override
+  void dispose() {
+    _bluetoothData?.cancel();
+    _phoneController.dispose();
+    _map?.dispose();
+    _model?.close();
+    super.dispose();
   }
+
+  // ---------------------------------------------------------------- setup --
 
   Future<void> _loadModel() async {
     try {
-      _interpreter = await Interpreter.fromAsset(
-        'assets/soil_npk_model.tflite',
-      );
-      print("TFLite model loaded successfully.");
+      final model = await NpkModel.load();
+      if (!mounted) return model.close();
+      setState(() => _model = model);
     } catch (e) {
-      print("Error loading model: $e");
+      debugPrint('Could not load NPK model: $e');
     }
   }
 
-  List<double> _predict(List<double> inputData) {
-    if (_interpreter == null) {
-      throw Exception("Model is not loaded yet.");
+  Future<void> _listenForSms() async {
+    try {
+      // SEND/RECEIVE_SMS are runtime permissions on Android 6+; without
+      // asking, sending fails and incoming robot messages never arrive.
+      final granted = await _telephony.requestPhoneAndSmsPermissions ?? false;
+      if (!granted) return;
+      _telephony.listenIncomingSms(
+        onNewMessage: (message) {
+          if (_mode == LinkMode.sms &&
+              samePhoneNumber(message.address, _phoneController.text)) {
+            _handleRobotMessage(message.body ?? '');
+          }
+        },
+        listenInBackground: false,
+      );
+    } catch (e) {
+      debugPrint('SMS unavailable on this device: $e');
     }
-
-    var input = inputData; // Model expects 2D array
-    var output = List.generate(
-      1,
-      (index) => List.filled(3, 0.0),
-    ); // Output NPK values
-
-    _interpreter!.run(input, output);
-    print(output);
-    return output[0]; // Returns [Nitrogen, Phosphorus, Potassium]
   }
 
-  Future<Position> determinePosition() async {
-    bool serviceEnabled;
-    LocationPermission permission;
-
-    serviceEnabled = await Geolocator.isLocationServiceEnabled();
-    if (!serviceEnabled) {
-      return Future.error('Location services are disabled.');
-    }
-
-    permission = await Geolocator.checkPermission();
-    if (permission == LocationPermission.denied) {
-      permission = await Geolocator.requestPermission();
+  Future<void> _locate({bool userAsked = false}) async {
+    try {
+      var permission = await Geolocator.checkPermission();
       if (permission == LocationPermission.denied) {
-        return Future.error('Location permissions are denied');
+        permission = await Geolocator.requestPermission();
       }
+      final allowed = permission == LocationPermission.whileInUse ||
+          permission == LocationPermission.always;
+      if (!allowed || !await Geolocator.isLocationServiceEnabled()) {
+        if (userAsked) _toast('locationUnavailable'.tr());
+        return;
+      }
+      final position = await Geolocator.getCurrentPosition();
+      if (!mounted) return;
+      final here = LatLng(position.latitude, position.longitude);
+      setState(() => _here = here);
+      await _map?.animateCamera(CameraUpdate.newLatLngZoom(here, 18));
+    } catch (e) {
+      if (userAsked) _toast('locationUnavailable'.tr());
     }
-
-    if (permission == LocationPermission.deniedForever) {
-      return Future.error(
-        'Location permissions are permanently denied, we cannot request permissions.',
-      );
-    }
-
-    return await Geolocator.getCurrentPosition();
   }
 
-  Future<void> _getCurrentLocation() async {
-    Position position = await determinePosition();
-    setState(() {
-      _currentPosition = LatLng(position.latitude, position.longitude);
-      _markers.add(
-        Marker(
-          markerId: const MarkerId('currentLocation'),
-          position: _currentPosition,
-          infoWindow: const InfoWindow(title: 'Current Location'),
-        ),
-      );
-    });
-    _mapController.animateCamera(
-      CameraUpdate.newCameraPosition(
-        CameraPosition(target: _currentPosition, zoom: 200),
-      ),
-    );
-  }
+  // --------------------------------------------------------- field marking --
 
-  void _onMapTapped(LatLng latLng) {
-    if (!_isSelecting) return;
-
+  void _onMapTap(LatLng point) {
+    if (!_marking || _corners.length >= 4) return;
     setState(() {
-      _polygonLatLngs.add(latLng);
-      _markers.add(
-        Marker(
-          markerId: MarkerId(latLng.toString()),
-          position: latLng,
-          draggable: true,
-          onDragEnd: (newPosition) {
-            setState(() {
-              _polygonLatLngs[_polygonLatLngs.indexOf(latLng)] = newPosition;
-              _updatePolygon();
-            });
-          },
-        ),
-      );
-      if (_polygonLatLngs.length == 4) {
-        _updatePolygon();
-        _generateWaypoints();
+      _corners.add(point);
+      if (_corners.length == 4) {
+        _marking = false;
+        _corners = orderCorners(_corners);
+        _waypoints = generateWaypoints(_corners, gridSize: _gridSize);
       }
     });
   }
 
-  void _updatePolygon() {
+  void _moveCorner(int index, LatLng to) {
     setState(() {
-      _polygons.clear();
-      _polygons.add(
-        Polygon(
-          polygonId: const PolygonId('selectedArea'),
-          points: _polygonLatLngs,
-          strokeColor: Colors.blue,
-          strokeWidth: 2,
-          fillColor: Colors.blue.withOpacity(0.15),
-        ),
-      );
+      _corners[index] = to;
+      if (_corners.length == 4) {
+        _corners = orderCorners(_corners);
+        _waypoints = generateWaypoints(_corners, gridSize: _gridSize);
+      }
     });
   }
 
-  void _generateWaypoints() {
-    if (_polygonLatLngs.length != 4) return;
+  void _toggleMarking() {
+    setState(() {
+      if (!_marking && _corners.length == 4) {
+        // Start over with a new field.
+        _corners = [];
+        _waypoints = const [];
+      }
+      _marking = !_marking;
+    });
+  }
 
-    _waypoints.clear();
+  void _clearField() {
+    setState(() {
+      _corners = [];
+      _waypoints = const [];
+      _readings.clear();
+      _robot = null;
+      _marking = false;
+    });
+  }
 
-    // Calculate the bounding box
-    double minLat =
-        _polygonLatLngs.map((p) => p.latitude).reduce((a, b) => a < b ? a : b);
-    double maxLat =
-        _polygonLatLngs.map((p) => p.latitude).reduce((a, b) => a > b ? a : b);
-    double minLng =
-        _polygonLatLngs.map((p) => p.longitude).reduce((a, b) => a < b ? a : b);
-    double maxLng =
-        _polygonLatLngs.map((p) => p.longitude).reduce((a, b) => a > b ? a : b);
+  // ----------------------------------------------------------- robot link --
 
-    // Generate waypoints evenly distributed within the bounding box
-    double latStep = (maxLat - minLat) / (_numWaypoints / 2);
-    double lngStep = (maxLng - minLng) / (_numWaypoints / 2);
-
-    for (double lat = minLat; lat <= maxLat; lat += latStep) {
-      for (double lng = minLng; lng <= maxLng; lng += lngStep) {
-        LatLng waypoint = LatLng(lat, lng);
-        if (_isPointInPolygon(waypoint, _polygonLatLngs)) {
-          _waypoints.add(waypoint);
+  Future<void> _sendWaypoints() async {
+    if (_waypoints.isEmpty) {
+      _toast('markFieldFirst'.tr());
+      return;
+    }
+    if (!_linkReady) {
+      _toast(_mode == LinkMode.sms
+          ? 'enterPhoneFirst'.tr()
+          : 'selectDeviceFirst'.tr());
+      _openConnectionSheet();
+      return;
+    }
+    final messages = [...encodeWaypointMessages(_waypoints), 'Start'];
+    setState(() => _sending = true);
+    try {
+      for (final message in messages) {
+        switch (_mode) {
+          case LinkMode.sms:
+            await _telephony.sendSms(
+              to: _phoneController.text.trim(),
+              message: message,
+            );
+          case LinkMode.bluetooth:
+            await _bluetooth.write('$message\n');
         }
       }
-    }
-
-    // Add waypoints as markers
-    for (LatLng waypoint in _waypoints) {
-      _markers.add(
-        Marker(
-          markerId: MarkerId(waypoint.toString()),
-          position: waypoint,
-          icon: BitmapDescriptor.defaultMarkerWithHue(
-            BitmapDescriptor.hueBlue,
-          ),
-        ),
-      );
+      _toast('waypointsSentSuccessfully'.tr());
+    } catch (e) {
+      _toast('sendFailed'.tr(namedArgs: {'error': '$e'}));
+    } finally {
+      if (mounted) setState(() => _sending = false);
     }
   }
 
-  bool _isPointInPolygon(LatLng point, List<LatLng> polygon) {
-    int intersectCount = 0;
-    for (int j = 0; j < polygon.length - 1; j++) {
-      if (_rayCastIntersect(point, polygon[j], polygon[j + 1])) {
-        intersectCount++;
-      }
+  Future<void> _refreshDevices() async {
+    try {
+      await _bluetooth.initPermissions();
+      final paired = await _bluetooth.getPairedDevices();
+      if (mounted) setState(() => _devices = paired);
+    } catch (e) {
+      _toast('errorLoadingDevices'.tr());
     }
-    return (intersectCount % 2) == 1; // odd = inside, even = outside;
   }
 
-  bool _rayCastIntersect(LatLng point, LatLng vertA, LatLng vertB) {
-    double aY = vertA.latitude;
-    double bY = vertB.latitude;
-    double aX = vertA.longitude;
-    double bX = vertB.longitude;
-    double pY = point.latitude;
-    double pX = point.longitude;
-
-    if ((aY > pY && bY > pY) || (aY < pY && bY < pY) || (aX < pX && bX < pX)) {
-      return false;
+  Future<void> _connect(Device device) async {
+    setState(() => _connecting = true);
+    try {
+      await _bluetooth.connect(device.address, _sppUuid);
+      // Subscribe once; the old code added a new listener on every mode
+      // change, so each message was processed several times.
+      _bluetoothData ??=
+          _bluetooth.onDeviceDataReceived().listen(_onBluetoothData);
+      if (mounted) setState(() => _device = device);
+    } catch (e) {
+      _toast('connectFailed'.tr(namedArgs: {'device': device.name ?? device.address}));
+    } finally {
+      if (mounted) setState(() => _connecting = false);
     }
-
-    double m = (aY - bY) / (aX - bX);
-    double bee = (-aX) * m + aY;
-    double x = (pY - bee) / m;
-
-    return x > pX;
   }
 
-  void _clearSelection() {
-    setState(() {
-      _polygonLatLngs.clear();
-      _markers.clear();
-      _polygons.clear();
-      _waypoints.clear();
-      _circles.clear();
-    });
-  }
-
-  void _focusCurrentLocation() {
-    _mapController.animateCamera(
-      CameraUpdate.newCameraPosition(
-        CameraPosition(target: _currentPosition, zoom: 12),
-      ),
+  void _onBluetoothData(Uint8List bytes) {
+    final (messages, rest) = splitMessages(
+      _bluetoothBuffer + utf8.decode(bytes, allowMalformed: true),
     );
+    // Drop runaway partial data instead of growing the buffer forever.
+    _bluetoothBuffer = rest.length > 2048 ? '' : rest;
+    messages.forEach(_handleRobotMessage);
   }
 
-  void _toggleSelectionMode() {
-    setState(() {
-      _isSelecting = !_isSelecting;
-    });
-  }
-
-  void _toggleWaypointScale() {
-    setState(() {
-      _showWaypointScale = !_showWaypointScale;
-    });
-  }
-
-  String _waypointsToString() {
-    return _waypoints.map((wp) => '${wp.latitude},${wp.longitude}').join('; ');
-  }
-
-  void _sendWaypoints() async {
-    print("sending...");
-
-    String message = _waypointsToString();
-    int chunkSize = 160 - 4; // Adjust for "GPS: " prefix
-    List<String> messageChunks = [];
-    List<String> waypoints = message.split('; ');
-
-    StringBuffer currentChunk = StringBuffer();
-
-    for (String waypoint in waypoints) {
-      if (currentChunk.length + waypoint.length + 2 > chunkSize) {
-        messageChunks.add("GPS: " + currentChunk.toString());
-        currentChunk.clear();
-      }
-      if (currentChunk.isNotEmpty) {
-        currentChunk.write('; ');
-      }
-      currentChunk.write(waypoint);
-    }
-
-    if (currentChunk.isNotEmpty) {
-      messageChunks.add("GPS: " + currentChunk.toString());
-    }
-
-    if (_transmissionMode == 'SMS') {
-      // Send each chunk as a separate SMS
-      for (String chunk in messageChunks) {
-        await telephony.sendSms(
-          to: _phoneNumberController
-              .text, // Use the phone number from the input field
-          message: chunk,
+  void _handleRobotMessage(String raw) {
+    final message = parseRobotMessage(raw);
+    if (!mounted || message == null) return;
+    switch (message) {
+      case SensorMessage(:final position, :final values):
+        final reading = SoilReading(
+          position: position,
+          sensorValues: values,
+          npk: _model?.predict(values),
         );
-      }
-      await telephony.sendSms(
-        to: _phoneNumberController
-            .text, // Use the phone number from the input field
-        message: "Start",
-      );
-    } else if (_transmissionMode == 'Bluetooth' && _selectedDevice != null) {
-      // Send data via Bluetooth
-      for (String chunk in messageChunks) {
-        await _bluetoothClassicPlugin.write(chunk);
-      }
-      await _bluetoothClassicPlugin.write("Start");
-    }
-
-    print("Sent");
-    ScaffoldMessenger.of(
-      context,
-    ).showSnackBar(SnackBar(content: Text('waypointsSentSuccessfully'.tr())));
-  }
-
-  void _listenForSms() {
-    telephony.listenIncomingSms(
-      onNewMessage: (SmsMessage message) {
-        print("Incoming SMS: ${message.address} - ${message.body}");
-        if (message.address == _phoneNumberController.text) {
-          print("GOing in");
-          _processReceivedSms(message.body ?? '');
-        }
-      },
-      listenInBackground: false,
-    );
-  }
-
-  void _processReceivedSms(String message) {
-    // Example message format: "Lat:12.3456,Lng:78.9012,Sensor:1.23-4.56-7.89"
-    message = message.replaceFirst(";", "");
-    if (message.startsWith('S:')) {
-      message = message.replaceFirst('S:', '');
-
-      final parts = message.split(',');
-      print(parts);
-
-      final lat = double.tryParse(parts[0].split(':')[1]);
-      final lng = double.tryParse(parts[1].split(':')[1]);
-      final sensorData = parts[2]
-          .split(':')[1]
-          .split('-')
-          .map((e) => double.tryParse(e) ?? 0.0)
-          .toList();
-      print(lat);
-      print(lng);
-      print(sensorData);
-      if (lat != null && lng != null && sensorData.every((e) => e != null)) {
-        final position = LatLng(lat, lng);
-        List<double> sensorData2 = sensorData.cast<double>();
-
-        sensorData2 = _predict(sensorData2);
-        print('HELOO');
-        print(sensorData2);
-
-        _sensorInfo =
-            '${sensorData[0].toStringAsFixed(2)}pH - ${sensorData[1].toStringAsFixed(2)} Moisture';
-        _predictedData =
-            '${sensorData2[0].toStringAsFixed(2)}N ${sensorData2[1].toStringAsFixed(2)}P ${sensorData2[2].toStringAsFixed(2)}K';
-        final output = _predictedData;
-        print("Received data: $_sensorInfo");
-
         setState(() {
-          _markers.removeWhere((marker) => marker.position == position);
-
-          _markers.add(
-            Marker(
-              markerId: MarkerId(position.toString()),
-              position: position,
-              icon: BitmapDescriptor.defaultMarkerWithHue(
-                BitmapDescriptor.hueGreen,
-              ),
-              infoWindow: InfoWindow(
-                title: 'receivedData'.tr(),
-                snippet: output,
-                onTap: () => _showBottomSheet(
-                    context, _sensorInfo, _predictedData, sensorData2),
-              ),
-            ),
-          );
-          Color circleColor = _getColorBasedOnNPK(
-              sensorData2[0], sensorData2[1], sensorData2[2]);
-          _circles.add(
-            Circle(
-              circleId: CircleId(position.toString()),
-              center: position,
-              radius: 3.66, // 12 feet in meters
-              strokeColor: circleColor,
-              strokeWidth: 2,
-              fillColor: circleColor.withOpacity(0.15),
-            ),
-          );
+          _readings.removeWhere((r) => r.position == position);
+          _readings.add(reading);
         });
+        _toast('receivedData'.tr(namedArgs: {'sensorInfo': _describe(reading)}));
+      case PositionMessage(:final position):
+        setState(() => _robot = position);
+      case SurveyDoneMessage():
+        _showReport();
+    }
+  }
 
-        ScaffoldMessenger.of(
-          context,
-        ).showSnackBar(
-            SnackBar(content: Text('receivedData'.tr(args: [_sensorInfo]))));
-      }
-    } else if (message.startsWith('C:')) {
-      message = message.replaceFirst('C:', '');
-      final parts = message.split(',');
-      print(parts);
+  // -------------------------------------------------------------- helpers --
 
-      final lat = double.tryParse(parts[0].split(':')[1]);
-      final lng = double.tryParse(parts[1].split(':')[1]);
-      if (lat != null && lng != null) {
-        final position = LatLng(lat, lng);
-        final output = _predictedData;
-        print("Received data: $_sensorInfo");
+  String _describe(SoilReading r) {
+    final ec = r.ec;
+    return [
+      'pH ${r.ph.toStringAsFixed(2)}',
+      if (ec != null) 'EC ${ec.toStringAsFixed(2)}',
+      '${'moisture'.tr()} ${r.moisture.toStringAsFixed(1)}',
+    ].join(' · ');
+  }
 
-        setState(() {
-          _markers.removeWhere((marker) => marker.position == position);
+  String _formatNpk(List<double> npk) =>
+      'N ${npk[0].toStringAsFixed(1)} · P ${npk[1].toStringAsFixed(1)} · '
+      'K ${npk[2].toStringAsFixed(1)} kg/ha';
 
-          _markers.add(Marker(
-            markerId: MarkerId(position.toString()),
-            position: position,
+  Color _healthColor(SoilHealth health) => switch (health) {
+        SoilHealth.good => Colors.green,
+        SoilHealth.fair => Colors.amber,
+        SoilHealth.poor => Colors.red,
+      };
+
+  double _healthHue(SoilHealth health) => switch (health) {
+        SoilHealth.good => BitmapDescriptor.hueGreen,
+        SoilHealth.fair => BitmapDescriptor.hueYellow,
+        SoilHealth.poor => BitmapDescriptor.hueRed,
+      };
+
+  void _toast(String message) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context)
+      ..hideCurrentSnackBar()
+      ..showSnackBar(SnackBar(content: Text(message)));
+  }
+
+  // ------------------------------------------------------------ map layers --
+
+  Set<Marker> get _markers => {
+        for (final (i, corner) in _corners.indexed)
+          Marker(
+            markerId: MarkerId('corner-$i'),
+            position: corner,
+            draggable: true,
             icon: BitmapDescriptor.defaultMarkerWithHue(
-              BitmapDescriptor.hueGreen,
+              BitmapDescriptor.hueOrange,
+            ),
+            onDragEnd: (to) => _moveCorner(i, to),
+          ),
+        for (final (i, reading) in _readings.indexed)
+          Marker(
+            markerId: MarkerId('reading-$i'),
+            position: reading.position,
+            icon: BitmapDescriptor.defaultMarkerWithHue(
+              reading.npk == null
+                  ? BitmapDescriptor.hueAzure
+                  : _healthHue(soilHealth(reading.npk!)),
             ),
             infoWindow: InfoWindow(
-              title: 'Robot',
-              snippet: output,
-            ),
-          ));
-        });
-      }
-    } else if (message.startsWith('D:')) {
-      _showFinalReport();
-    }
-  }
-
-  void _showFinalReport() {
-    // Calculate average NPK values
-    List<double> averageNpkValues = _calculateAverageNpkValues();
-
-    // Generate suggested crops and fertilizer amount based on average NPK values
-    final suggestedCrops = suggestCrops(
-        averageNpkValues[0], averageNpkValues[1], averageNpkValues[2]);
-    final suggestedFertilizer = suggestFertilizerAmount(averageNpkValues);
-
-    showModalBottomSheet(
-      context: context,
-      builder: (BuildContext context) {
-        return SingleChildScrollView(
-          child: Container(
-            width: double.infinity,
-            padding: const EdgeInsets.all(16.0),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Text('finalReport'.tr(),
-                    style:
-                        TextStyle(fontWeight: FontWeight.bold, fontSize: 18)),
-                const SizedBox(height: 10),
-                Text('averageNpkValues'.tr(),
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                Text('N: ${averageNpkValues[0].toStringAsFixed(2)} kg/ha, '
-                    'P: ${averageNpkValues[1].toStringAsFixed(2)} kg/ha, '
-                    'K: ${averageNpkValues[2].toStringAsFixed(2)} kg/ha'),
-                const SizedBox(height: 10),
-                Text('suggestedCrops'.tr(),
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                Text(suggestedCrops.join(', ')),
-                const SizedBox(height: 10),
-                Text('suggestedNpkFertilizerAmount'.tr(),
-                    style: TextStyle(fontWeight: FontWeight.bold)),
-                ...suggestedFertilizer.split('\n').map((suggestion) {
-                  return Card(
-                    margin: const EdgeInsets.symmetric(vertical: 5.0),
-                    child: Padding(
-                      padding: const EdgeInsets.all(8.0),
-                      child: Text(suggestion),
-                    ),
-                  );
-                }).toList(),
-              ],
+              title: reading.npk == null
+                  ? _describe(reading)
+                  : _formatNpk(reading.npk!),
+              snippet: 'predictedData'.tr(),
+              onTap: () => _showReading(reading),
             ),
           ),
-        );
-      },
-    );
-  }
-
-  List<double> _calculateAverageNpkValues() {
-    // Collect all NPK values from the received data points
-    List<List<double>> npkValuesList = _markers.map((marker) {
-      // Extract NPK values from the marker's info window snippet
-      final snippet = marker.infoWindow.snippet ?? '';
-      final npkValues =
-          snippet.split(' ').map((e) => double.tryParse(e) ?? 0.0).toList();
-      return npkValues;
-    }).toList();
-
-    // Calculate the average NPK values
-    double totalN = 0.0;
-    double totalP = 0.0;
-    double totalK = 0.0;
-    int count = 0;
-
-    for (var npkValues in npkValuesList) {
-      if (npkValues.length == 3) {
-        totalN += npkValues[0];
-        totalP += npkValues[1];
-        totalK += npkValues[2];
-        count++;
-      }
-    }
-
-    return [totalN / count, totalP / count, totalK / count];
-  }
-
-  final npkCrops = {
-    "high_nitrogen": {
-      "ratio": [30.0, 10.0, 10.0], // Example ratio for leafy greens
-      "crops": ["Lettuce", "Spinach", "Kale", "Hybrid Rice"]
-    },
-    "high_phosphorus": {
-      "ratio": [10.0, 30.0, 20.0], // Example ratio for fruits
-      "crops": ["Apples", "Oranges", "Grapes", "Black Gram"]
-    },
-    "balanced": {
-      "ratio": [20.0, 20.0, 20.0], // Balanced ratio for general use
-      "crops": ["Corn", "Wheat", "Soybeans", "Groundnut"]
-    },
-    "high_potassium": {
-      "ratio": [10.0, 10.0, 30.0], // Example ratio for disease resistance
-      "crops": ["Potatoes", "Tomatoes", "Peppers", "Maize"]
-    }
-  };
-
-  List<String> suggestCrops(
-      double nitrogen, double phosphorus, double potassium) {
-    // Define common NPK ratios and their associated crops
-
-    // Calculate the closest match
-    String? closestMatch;
-    double minDiff = double.infinity;
-
-    npkCrops.forEach((npkType, details) {
-      final ratio = (details["ratio"] as List).map((e) => e as double).toList();
-      final ratioDiff = (nitrogen - ratio[0]).abs() +
-          (phosphorus - ratio[1]).abs() +
-          (potassium - ratio[2]).abs();
-      if (ratioDiff < minDiff) {
-        minDiff = ratioDiff;
-        closestMatch = npkType;
-      }
-    });
-
-    // Return suggested crops based on the closest match
-    if (closestMatch != null) {
-      return (npkCrops[closestMatch]!["crops"] as List)
-          .map((e) => e as String)
-          .toList();
-    } else {
-      return [
-        "No specific match found. Consider a balanced NPK ratio like 20-20-20."
-      ];
-    }
-  }
-
-  String suggestFertilizerAmount(List<double> npkValues) {
-    StringBuffer fertilizerSuggestions = StringBuffer();
-
-    npkCrops.forEach((npkType, details) {
-      final ratio = (details["ratio"] as List).map((e) => e as double).toList();
-      final crops = (details["crops"] as List).map((e) => e as String).toList();
-
-      double nitrogenNeeded = ratio[0] - npkValues[0];
-      double phosphorusNeeded = ratio[1] - npkValues[1];
-      double potassiumNeeded = ratio[2] - npkValues[2];
-      double costPerKg = 50; // Example cost per kg of fertilizer
-      double totalCost =
-          (nitrogenNeeded + phosphorusNeeded + potassiumNeeded) * costPerKg;
-
-      fertilizerSuggestions.writeln(
-          '${crops.join(', ')}: N: ${nitrogenNeeded.toStringAsFixed(2)} kg/ha, '
-          'P: ${phosphorusNeeded.toStringAsFixed(2)} kg/ha, '
-          'K: ${potassiumNeeded.toStringAsFixed(2)} kg/ha, '
-          'Cost: \₹${totalCost.toStringAsFixed(2)}');
-    });
-
-    return fertilizerSuggestions.toString();
-  }
-
-  void _showBottomSheet(BuildContext context, String sensorInfo,
-      String predictedData, List<double> npkValues) {
-    print("hlo");
-    final suggestedCrops =
-        suggestCrops(npkValues[0], npkValues[1], npkValues[2]);
-    final suggestedFertilizer = suggestFertilizerAmount(npkValues);
-
-    showModalBottomSheet(
-      context: context,
-      builder: (BuildContext context) {
-        return SingleChildScrollView(
-            child: Container(
-          width: double.infinity,
-          padding: const EdgeInsets.all(16.0),
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text('sensorData'.tr(),
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              Text(sensorInfo),
-              const SizedBox(height: 10),
-              Text('predictedData'.tr(),
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              Text(predictedData),
-              const SizedBox(height: 10),
-              Text('suggestedCrops'.tr(),
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              Text(suggestedCrops.join(', ')),
-              const SizedBox(height: 10),
-              Text('suggestedNpkFertilizerAmount'.tr(),
-                  style: TextStyle(fontWeight: FontWeight.bold)),
-              ...suggestedFertilizer.split('\n').map((suggestion) {
-                return Card(
-                  margin: const EdgeInsets.symmetric(vertical: 5.0),
-                  child: Padding(
-                    padding: const EdgeInsets.all(8.0),
-                    child: Text(suggestion),
-                  ),
-                );
-              }).toList(),
-            ],
-          ),
-        ));
-      },
-    );
-  }
-
-  Color _getColorBasedOnNPK(
-      double nitrogen, double phosphorus, double potassium) {
-    // Define thresholds for NPK values
-    const double highThreshold = 10.0;
-    const double mediumThreshold = 5.0;
-    const double phighThreshold = 6.0;
-    const double pmediumThreshold = 4.0;
-    const double khighThreshold = 10.0;
-    const double kmediumThreshold = 8.0;
-
-    if (nitrogen > highThreshold &&
-        phosphorus > phighThreshold &&
-        potassium > khighThreshold) {
-      return Colors.green;
-    } else if (nitrogen > mediumThreshold &&
-        phosphorus > pmediumThreshold &&
-        potassium > kmediumThreshold) {
-      return Colors.yellow;
-    } else {
-      return Colors.red;
-    }
-  }
-
-  void _showConnectionDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: Text('selectTransmissionMode'.tr()),
-          content: SingleChildScrollView(
-            child: Container(
-              width: double.maxFinite,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  SizedBox(
-                    width: 300, // Limit the width of the dropdown
-                    child: DropdownButton<String>(
-                      value: _transmissionMode,
-                      items: <String>['SMS', 'Bluetooth']
-                          .map<DropdownMenuItem<String>>((String value) {
-                        return DropdownMenuItem<String>(
-                          value: value,
-                          child: Text(value),
-                        );
-                      }).toList(),
-                      onChanged: (String? newValue) async {
-                        setState(() {
-                          _transmissionMode = newValue!;
-                          if (_transmissionMode == 'Bluetooth') {
-                            _initBluetooth();
-                          }
-                        });
-                        Navigator.of(context).pop();
-                        _showDetailsDialog();
-                      },
-                    ),
-                  ),
-                ],
-              ),
+        if (_robot != null)
+          Marker(
+            markerId: const MarkerId('robot'),
+            position: _robot!,
+            icon: BitmapDescriptor.defaultMarkerWithHue(
+              BitmapDescriptor.hueViolet,
             ),
+            infoWindow: InfoWindow(title: 'robot'.tr()),
           ),
-        );
-      },
-    );
-  }
+      };
 
-  void _showDetailsDialog() {
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (BuildContext context) {
-        return AlertDialog(
-          title: Text(_transmissionMode == 'SMS'
-              ? 'enterMobileNumber'.tr()
-              : 'selectBluetoothDevice'.tr()),
-          content: SingleChildScrollView(
-            child: Container(
-              width: double.maxFinite,
-              child: Column(
-                mainAxisSize: MainAxisSize.min,
-                children: [
-                  if (_transmissionMode == 'SMS')
-                    TextField(
-                      controller: _phoneNumberController,
-                      decoration: InputDecoration(
-                        labelText: 'phoneNumber'.tr(),
-                        border: OutlineInputBorder(),
-                      ),
-                      keyboardType: TextInputType.phone,
-                    ),
-                  if (_transmissionMode == 'Bluetooth')
-                    FutureBuilder<List<Device>>(
-                      future: _bluetoothClassicPlugin.getPairedDevices(),
-                      builder: (context, snapshot) {
-                        if (snapshot.connectionState ==
-                            ConnectionState.waiting) {
-                          return const CircularProgressIndicator();
-                        } else if (snapshot.hasError) {
-                          return Text('errorLoadingDevices'.tr());
-                        } else if (!snapshot.hasData ||
-                            snapshot.data!.isEmpty) {
-                          return Text('noBluetoothDevicesFound'.tr());
-                        } else {
-                          return Container(
-                            width: 350, // Increase the width of the dropdown
-                            child: DropdownButton<Device>(
-                              value: _selectedDevice,
-                              items: snapshot.data!
-                                  .map<DropdownMenuItem<Device>>(
-                                      (Device device) {
-                                return DropdownMenuItem<Device>(
-                                  value: device,
-                                  child: Text(device.name ?? 'Unknown Device'),
-                                );
-                              }).toList(),
-                              onChanged: (Device? newValue) async {
-                                try {
-                                  await _bluetoothClassicPlugin.stopScan();
-                                  await _bluetoothClassicPlugin.connect(
-                                    newValue!.address,
-                                    "00001101-0000-1000-8000-00805f9b34fb",
-                                  );
-                                  setState(() {
-                                    _selectedDevice = newValue;
-                                  });
-                                } catch (e) {
-                                  print("Error connecting to device: $e");
-                                  ScaffoldMessenger.of(context).showSnackBar(
-                                    SnackBar(
-                                        content: Text(
-                                            'Failed to connect to device: ${newValue?.name ?? 'Unknown Device'}')),
-                                  );
-                                }
-                              },
-                            ),
-                          );
-                        }
-                      },
-                    ),
-                ],
-              ),
-            ),
+  Set<Polygon> get _polygons => _corners.length < 3
+      ? const {}
+      : {
+          Polygon(
+            polygonId: const PolygonId('field'),
+            points: _corners,
+            strokeColor: Colors.white,
+            strokeWidth: 2,
+            fillColor: Colors.white.withValues(alpha: 0.15),
           ),
-          actions: [
-            TextButton(
-              onPressed: () {
-                Navigator.of(context).pop();
-                _showAreaSelectionGuide();
-              },
-              child: Text('connect'.tr()),
-            ),
-          ],
-        );
-      },
-    );
-  }
+        };
 
-  void _showAreaSelectionGuide() {
-    ScaffoldMessenger.of(context).showSnackBar(
-      SnackBar(content: Text('selectAnAreaOnTheMap'.tr())),
-    );
-  }
+  Set<Polyline> get _polylines => _waypoints.length < 2
+      ? const {}
+      : {
+          Polyline(
+            polylineId: const PolylineId('survey-path'),
+            points: _waypoints,
+            color: Colors.lightBlueAccent,
+            width: 2,
+            patterns: [PatternItem.dash(8), PatternItem.gap(6)],
+          ),
+        };
+
+  Set<Circle> get _circles => {
+        for (final (i, wp) in _waypoints.indexed)
+          Circle(
+            circleId: CircleId('wp-$i'),
+            center: wp,
+            radius: 0.8,
+            strokeWidth: 1,
+            strokeColor: Colors.white,
+            fillColor: Colors.lightBlueAccent,
+          ),
+        for (final (i, reading) in _readings.indexed)
+          if (reading.npk != null)
+            Circle(
+              circleId: CircleId('sample-$i'),
+              center: reading.position,
+              radius: 3.66, // 12 ft sampling radius
+              strokeWidth: 2,
+              strokeColor: _healthColor(soilHealth(reading.npk!)),
+              fillColor: _healthColor(soilHealth(reading.npk!))
+                  .withValues(alpha: 0.15),
+            ),
+      };
+
+  // -------------------------------------------------------------------- UI --
 
   @override
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
-        title: Text('appTitle'.tr().toString()),
+        title: Text('appTitle'.tr()),
         actions: [
           IconButton(
-            icon: const Icon(Icons.delete),
-            onPressed: _clearSelection,
-          ),
-          IconButton(
-            icon: const Icon(Icons.settings),
-            onPressed: _toggleWaypointScale,
+            tooltip: 'connectionSettings'.tr(),
+            onPressed: _openConnectionSheet,
+            icon: Icon(
+              _mode == LinkMode.sms ? Icons.sms_outlined : Icons.bluetooth,
+              color: _linkReady ? null : Theme.of(context).colorScheme.error,
+            ),
           ),
           PopupMenuButton<Locale>(
-            icon: const Icon(Icons.language),
-            onSelected: (Locale locale) {
-              context.setLocale(locale);
-            },
-            itemBuilder: (BuildContext context) {
-              return [
-                PopupMenuItem(
-                  value: const Locale('en', 'US'),
-                  child: const Text('English'),
-                ),
-                PopupMenuItem(
-                  value: const Locale('ta', 'IN'),
-                  child: const Text('Tamil'),
-                ),
-              ];
-            },
+            tooltip: 'language'.tr(),
+            icon: const Icon(Icons.translate),
+            onSelected: context.setLocale,
+            itemBuilder: (_) => const [
+              PopupMenuItem(value: Locale('en', 'US'), child: Text('English')),
+              PopupMenuItem(value: Locale('ta', 'IN'), child: Text('தமிழ்')),
+            ],
+          ),
+          IconButton(
+            tooltip: 'clearField'.tr(),
+            onPressed: _corners.isEmpty && _readings.isEmpty ? null : _clearField,
+            icon: const Icon(Icons.delete_outline),
           ),
         ],
       ),
-      body: Column(
+      body: Stack(
         children: [
-          if (_showWaypointScale)
-            Padding(
-              padding: const EdgeInsets.all(8.0),
-              child: Column(
-                children: [
-                  TextField(
-                    decoration: InputDecoration(
-                      labelText: 'scale'.tr(),
-                      border: OutlineInputBorder(),
-                    ),
-                    keyboardType: TextInputType.number,
-                    onChanged: (value) {
-                      setState(() {
-                        _numWaypoints = int.tryParse(value) ?? 10;
-                      });
-                    },
-                  ),
-                  const SizedBox(height: 10),
-                  DropdownButton<String>(
-                    value: _transmissionMode,
-                    items: <String>['SMS', 'Bluetooth']
-                        .map<DropdownMenuItem<String>>((String value) {
-                      return DropdownMenuItem<String>(
-                        value: value,
-                        child: Text(value),
-                      );
-                    }).toList(),
-                    onChanged: (String? newValue) async {
-                      if (newValue == 'Bluetooth') {
-                        await _initBluetooth();
-
-                        try {
-                          _bluetoothDevices =
-                              await _bluetoothClassicPlugin.getPairedDevices();
-                        } catch (e) {
-                          print(e);
-                        }
-
-                        try {
-                          _bluetoothClassicPlugin.onDeviceDiscovered().listen(
-                            (event) {
-                              _bluetoothDevices = [..._bluetoothDevices, event];
-                            },
-                          );
-                          await _bluetoothClassicPlugin.startScan();
-                        } catch (e) {
-                          print(e);
-                        }
-                        print(_bluetoothDevices);
-                        try {
-                          _bluetoothClassicPlugin
-                              .onDeviceDataReceived()
-                              .listen((event) {
-                            setState(() {
-                              _data = Uint8List.fromList([..._data, ...event]);
-                              String receivedString = utf8.decode(event);
-
-                              receivedDataBuffer += receivedString;
-                              print(receivedString);
-                              if (receivedString.contains(';')) {
-                                print("Buffer");
-                                print(receivedDataBuffer);
-                                _processReceivedSms(receivedDataBuffer);
-                                receivedDataBuffer = '';
-                              }
-                            });
-                          });
-                        } catch (e) {
-                          print(e);
-                        }
-                      }
-                      setState(() {
-                        _transmissionMode = newValue!;
-                      });
-                    },
-                  ),
-                  if (_transmissionMode == 'SMS')
-                    TextField(
-                      controller: _phoneNumberController,
-                      decoration: const InputDecoration(
-                        labelText: 'Phone Number',
-                        border: OutlineInputBorder(),
-                      ),
-                      keyboardType: TextInputType.phone,
-                    ),
-                  if (_transmissionMode == 'Bluetooth')
-                    DropdownButton<Device>(
-                      value: _selectedDevice,
-                      items: _bluetoothDevices
-                          .map<DropdownMenuItem<Device>>((Device device) {
-                        return DropdownMenuItem<Device>(
-                          value: device,
-                          child: Text(device.name ?? 'Unknown Device'),
-                        );
-                      }).toList(),
-                      onChanged: (Device? newValue) async {
-                        try {
-                          await _bluetoothClassicPlugin.stopScan();
-                          await _bluetoothClassicPlugin.connect(
-                            newValue!.address,
-                            "00001101-0000-1000-8000-00805f9b34fb",
-                          );
-                          setState(() {
-                            _selectedDevice = newValue;
-                          });
-                        } catch (e) {
-                          print("Error connecting to device: $e");
-                          ScaffoldMessenger.of(context).showSnackBar(
-                            SnackBar(
-                                content: Text(
-                                    'Failed to connect to device: ${newValue?.name ?? 'Unknown Device'}')),
-                          );
-                        }
-                      },
-                    ),
-                ],
-              ),
+          GoogleMap(
+            mapType: MapType.hybrid,
+            initialCameraPosition: CameraPosition(
+              target: _here ?? _fallbackCenter,
+              zoom: 17,
             ),
-          Expanded(
-            child: GoogleMap(
-              mapType: MapType.satellite, // Set the map type to satellite
-              initialCameraPosition: const CameraPosition(
-                target: LatLng(
-                  0,
-                  0,
-                ), // Default position before getting current location
-                zoom: 12,
-              ),
-              markers: _markers,
-              circles: _circles,
-              polylines: _polylines,
-              polygons: _polygons,
-              onMapCreated: (GoogleMapController controller) {
-                _mapController = controller;
-              },
-              onTap: _onMapTapped,
+            myLocationEnabled: _here != null,
+            myLocationButtonEnabled: false,
+            markers: _markers,
+            polygons: _polygons,
+            polylines: _polylines,
+            circles: _circles,
+            onMapCreated: (controller) => _map = controller,
+            onTap: _onMapTap,
+          ),
+          Positioned(
+            top: 12,
+            left: 12,
+            right: 12,
+            child: _StatusCard(
+              text: _statusText,
+              icon: _statusIcon,
+              action: _statusAction,
             ),
           ),
         ],
       ),
       floatingActionButton: Column(
         mainAxisAlignment: MainAxisAlignment.end,
+        crossAxisAlignment: CrossAxisAlignment.end,
         children: [
-          // FloatingActionButton(
-          //   onPressed: _toggleSelectionMode,
-          //   child: Icon(_isSelecting ? Icons.check : Icons.edit),
-          // ),
-          const SizedBox(height: 10),
-          FloatingActionButton(
-            onPressed: _focusCurrentLocation,
+          FloatingActionButton.small(
+            heroTag: 'locate',
+            tooltip: 'myLocation'.tr(),
+            onPressed: () => _locate(userAsked: true),
             child: const Icon(Icons.my_location),
           ),
-          const SizedBox(height: 10),
-          FloatingActionButton(
-            onPressed: _sendWaypoints,
-            child: const Icon(Icons.send),
+          const SizedBox(height: 12),
+          if (_readings.isNotEmpty) ...[
+            FloatingActionButton.extended(
+              heroTag: 'report',
+              onPressed: _showReport,
+              icon: const Icon(Icons.assessment_outlined),
+              label: Text('viewReport'.tr()),
+            ),
+            const SizedBox(height: 12),
+          ],
+          FloatingActionButton.extended(
+            heroTag: 'mark',
+            onPressed: _toggleMarking,
+            icon: Icon(_marking ? Icons.close : Icons.crop_free),
+            label: Text(_marking ? 'cancel'.tr() : 'markField'.tr()),
+          ),
+          const SizedBox(height: 12),
+          FloatingActionButton.extended(
+            heroTag: 'send',
+            onPressed: _sending || _waypoints.isEmpty ? null : _sendWaypoints,
+            backgroundColor: _waypoints.isEmpty
+                ? Theme.of(context).disabledColor.withValues(alpha: 0.12)
+                : null,
+            icon: _sending
+                ? const SizedBox.square(
+                    dimension: 18,
+                    child: CircularProgressIndicator(strokeWidth: 2),
+                  )
+                : const Icon(Icons.send),
+            label: Text(_sending ? 'sending'.tr() : 'sendToRobot'.tr()),
           ),
         ],
       ),
     );
   }
+
+  String get _statusText {
+    if (_marking) {
+      return 'tapCorners'.tr(namedArgs: {'count': '${_corners.length}'});
+    }
+    if (_readings.isNotEmpty) {
+      return 'readingsCount'.tr(namedArgs: {'count': '${_readings.length}'});
+    }
+    if (_waypoints.isNotEmpty) {
+      return 'waypointsReady'.tr(namedArgs: {'count': '${_waypoints.length}'});
+    }
+    if (!_linkReady) return 'notConnected'.tr();
+    return 'selectAnAreaOnTheMap'.tr();
+  }
+
+  IconData get _statusIcon {
+    if (_marking) return Icons.touch_app_outlined;
+    if (_readings.isNotEmpty) return Icons.grass;
+    if (_waypoints.isNotEmpty) return Icons.route;
+    if (!_linkReady) return Icons.link_off;
+    return Icons.crop_free;
+  }
+
+  Widget? get _statusAction {
+    if (!_marking && !_linkReady) {
+      return TextButton(
+        onPressed: _openConnectionSheet,
+        child: Text('connect'.tr()),
+      );
+    }
+    if (_marking && _corners.isNotEmpty) {
+      return TextButton(
+        onPressed: () => setState(() => _corners.removeLast()),
+        child: Text('undo'.tr()),
+      );
+    }
+    return null;
+  }
+
+  // --------------------------------------------------------------- sheets --
+
+  void _openConnectionSheet() {
+    if (_mode == LinkMode.bluetooth && _devices.isEmpty) _refreshDevices();
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) => StatefulBuilder(
+        builder: (context, setSheetState) {
+          void update(VoidCallback change) {
+            setState(change);
+            setSheetState(() {});
+          }
+
+          return Padding(
+            padding: EdgeInsets.fromLTRB(
+              20,
+              0,
+              20,
+              20 + MediaQuery.viewInsetsOf(context).bottom,
+            ),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                Text(
+                  'connectionSettings'.tr(),
+                  style: Theme.of(context).textTheme.titleLarge,
+                ),
+                const SizedBox(height: 16),
+                SegmentedButton<LinkMode>(
+                  segments: const [
+                    ButtonSegment(
+                      value: LinkMode.sms,
+                      icon: Icon(Icons.sms_outlined),
+                      label: Text('SMS'),
+                    ),
+                    ButtonSegment(
+                      value: LinkMode.bluetooth,
+                      icon: Icon(Icons.bluetooth),
+                      label: Text('Bluetooth'),
+                    ),
+                  ],
+                  selected: {_mode},
+                  onSelectionChanged: (selection) {
+                    update(() => _mode = selection.first);
+                    if (_mode == LinkMode.bluetooth && _devices.isEmpty) {
+                      _refreshDevices().then((_) => setSheetState(() {}));
+                    }
+                  },
+                ),
+                const SizedBox(height: 16),
+                if (_mode == LinkMode.sms)
+                  TextField(
+                    controller: _phoneController,
+                    keyboardType: TextInputType.phone,
+                    onChanged: (_) => update(() {}),
+                    decoration: InputDecoration(
+                      labelText: 'phoneNumber'.tr(),
+                      hintText: '+91 98765 43210',
+                      prefixIcon: const Icon(Icons.phone),
+                      border: const OutlineInputBorder(),
+                    ),
+                  )
+                else ...[
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Text(
+                          'selectBluetoothDevice'.tr(),
+                          style: Theme.of(context).textTheme.titleSmall,
+                        ),
+                      ),
+                      TextButton.icon(
+                        onPressed: () =>
+                            _refreshDevices().then((_) => setSheetState(() {})),
+                        icon: const Icon(Icons.refresh),
+                        label: Text('refresh'.tr()),
+                      ),
+                    ],
+                  ),
+                  if (_devices.isEmpty)
+                    Padding(
+                      padding: const EdgeInsets.symmetric(vertical: 12),
+                      child: Text('noBluetoothDevicesFound'.tr()),
+                    ),
+                  for (final device in _devices)
+                    ListTile(
+                      contentPadding: EdgeInsets.zero,
+                      leading: const Icon(Icons.memory),
+                      title: Text(device.name ?? device.address),
+                      subtitle: Text(device.address),
+                      trailing: _device?.address == device.address
+                          ? Chip(label: Text('connected'.tr()))
+                          : FilledButton.tonal(
+                              onPressed: _connecting
+                                  ? null
+                                  : () => _connect(device)
+                                      .then((_) => setSheetState(() {})),
+                              child: Text('connect'.tr()),
+                            ),
+                    ),
+                ],
+                const SizedBox(height: 16),
+                Text(
+                  'gridDensity'.tr(namedArgs: {'count': '$_gridSize'}),
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                Slider(
+                  value: _gridSize.toDouble(),
+                  min: 2,
+                  max: 10,
+                  divisions: 8,
+                  label: '$_gridSize × $_gridSize',
+                  onChanged: (v) => update(() {
+                    _gridSize = v.round();
+                    if (_corners.length == 4) {
+                      _waypoints =
+                          generateWaypoints(_corners, gridSize: _gridSize);
+                    }
+                  }),
+                ),
+                FilledButton(
+                  onPressed: () => Navigator.pop(context),
+                  child: Text('done'.tr()),
+                ),
+              ],
+            ),
+          );
+        },
+      ),
+    );
+  }
+
+  void _showReading(SoilReading reading) {
+    final npk = reading.npk;
+    _showSheet([
+      _SheetSection(title: 'sensorData'.tr(), body: Text(_describe(reading))),
+      if (npk == null)
+        _SheetSection(
+          title: 'predictedData'.tr(),
+          body: Text('predictionUnavailable'.tr(
+            namedArgs: {'count': '${reading.sensorValues.length}'},
+          )),
+        )
+      else ..._adviceSections(npk, title: 'predictedData'.tr()),
+    ]);
+  }
+
+  void _showReport() {
+    final average = averageNpk(_readings);
+    _showSheet([
+      Text('finalReport'.tr(), style: Theme.of(context).textTheme.titleLarge),
+      const SizedBox(height: 4),
+      Text('readingsCount'.tr(namedArgs: {'count': '${_readings.length}'})),
+      if (_readings.isEmpty)
+        _SheetSection(title: '', body: Text('noReadingsYet'.tr()))
+      else if (average == null)
+        _SheetSection(
+          title: 'averageNpkValues'.tr(),
+          body: Text('predictionUnavailable'.tr(
+            namedArgs: {'count': '${_readings.first.sensorValues.length}'},
+          )),
+        )
+      else
+        ..._adviceSections(average, title: 'averageNpkValues'.tr()),
+    ]);
+  }
+
+  List<Widget> _adviceSections(List<double> npk, {required String title}) {
+    final best = closestProfile(npk);
+    return [
+      _SheetSection(
+        title: title,
+        body: Row(
+          children: [
+            Icon(Icons.circle, size: 12, color: _healthColor(soilHealth(npk))),
+            const SizedBox(width: 8),
+            Expanded(child: Text(_formatNpk(npk))),
+          ],
+        ),
+      ),
+      _SheetSection(
+        title: 'suggestedCrops'.tr(),
+        body: Wrap(
+          spacing: 8,
+          runSpacing: 4,
+          children: [for (final c in best.crops) Chip(label: Text(c))],
+        ),
+      ),
+      _SheetSection(
+        title: 'suggestedNpkFertilizerAmount'.tr(),
+        body: Column(
+          children: [
+            for (final advice in fertilizerAdvice(npk))
+              Card(
+                margin: const EdgeInsets.symmetric(vertical: 4),
+                child: ListTile(
+                  title: Text(advice.profile.crops.join(', ')),
+                  subtitle: Text(
+                    'N ${advice.n.toStringAsFixed(1)} · '
+                    'P ${advice.p.toStringAsFixed(1)} · '
+                    'K ${advice.k.toStringAsFixed(1)} kg/ha',
+                  ),
+                  trailing: Text('₹${advice.cost.toStringAsFixed(0)}'),
+                ),
+              ),
+          ],
+        ),
+      ),
+    ];
+  }
+
+  void _showSheet(List<Widget> children) {
+    showModalBottomSheet<void>(
+      context: context,
+      isScrollControlled: true,
+      showDragHandle: true,
+      builder: (context) => DraggableScrollableSheet(
+        expand: false,
+        initialChildSize: 0.6,
+        maxChildSize: 0.9,
+        builder: (context, controller) => ListView(
+          controller: controller,
+          padding: const EdgeInsets.fromLTRB(20, 0, 20, 24),
+          children: children,
+        ),
+      ),
+    );
+  }
 }
 
-LatLng _parseLatLng(String input) {
-  final parts = input.split(',');
-  if (parts.length == 2) {
-    final lat = double.tryParse(parts[0].trim());
-    final lng = double.tryParse(parts[1].trim());
-    if (lat != null && lng != null) {
-      return LatLng(lat, lng);
-    }
+class _StatusCard extends StatelessWidget {
+  const _StatusCard({required this.text, required this.icon, this.action});
+
+  final String text;
+  final IconData icon;
+  final Widget? action;
+
+  @override
+  Widget build(BuildContext context) {
+    return Card(
+      elevation: 3,
+      child: Padding(
+        padding: const EdgeInsets.fromLTRB(16, 6, 8, 6),
+        child: Row(
+          children: [
+            Icon(icon, color: Theme.of(context).colorScheme.primary),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Text(text),
+              ),
+            ),
+            if (action != null) action!,
+          ],
+        ),
+      ),
+    );
   }
-  return const LatLng(0.0, 0.0);
+}
+
+class _SheetSection extends StatelessWidget {
+  const _SheetSection({required this.title, required this.body});
+
+  final String title;
+  final Widget body;
+
+  @override
+  Widget build(BuildContext context) {
+    return Padding(
+      padding: const EdgeInsets.only(top: 16),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          if (title.isNotEmpty) ...[
+            Text(title, style: Theme.of(context).textTheme.titleSmall),
+            const SizedBox(height: 6),
+          ],
+          body,
+        ],
+      ),
+    );
+  }
 }
